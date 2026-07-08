@@ -74,17 +74,20 @@ app.whenReady().then(async () => {
     const shared = Buffer.alloc(200000, 42);
     fs.writeFileSync(path.join(ca, 'holiday.mp4'), shared);
     fs.writeFileSync(path.join(ca, 'only_a.bin'), Buffer.alloc(50000, 1));
+    fs.writeFileSync(path.join(ca, 'only_a copy.bin'), Buffer.alloc(50000, 1)); // within-A duplicate
     fs.writeFileSync(path.join(cb, 'holiday backup.mp4'), shared);          // same content, different name
-    fs.writeFileSync(path.join(cb, 'same_size_diff.bin'), Buffer.alloc(50000, 9)); // same size as only_a, different bytes
+    fs.writeFileSync(path.join(cb, 'same_size_diff.bin'), Buffer.alloc(50000, 9)); // same size, different bytes
     const cmp = await t.compareRoots(path.join(work, 'cmpA'), path.join(work, 'cmpB'));
-    console.log('COMPARE groups=%d overlapA=%d overlapB=%d filesA=%d filesB=%d',
-      cmp.groupCount, cmp.a.overlapBytes, cmp.b.overlapBytes, cmp.a.files, cmp.b.files);
-    for (const g of cmp.groups) console.log('  set:', g.files.map(f => `${f.side}:${f.name}`).join(' | '), 'verified=', g.verified);
-    const okCmp = cmp.groupCount === 1 &&
+    console.log('COMPARE scopes=%j overlapA=%d overlapB=%d withinA=%d withinB=%d',
+      cmp.scopeCounts, cmp.a.overlapBytes, cmp.b.overlapBytes, cmp.a.withinWasted, cmp.b.withinWasted);
+    for (const g of cmp.groups) console.log('  set[%s]:', g.scope, g.files.map(f => `${f.side}:${f.name}`).join(' | '), 'verified=', g.verified);
+    const cross = cmp.groups.find(g => g.scope === 'cross');
+    const okCmp = cmp.scopeCounts.cross === 1 && cmp.scopeCounts.a === 1 && cmp.scopeCounts.b === 0 &&
       cmp.a.overlapBytes === 200000 && cmp.b.overlapBytes === 200000 &&
-      cmp.groups[0].files.some(f => f.side === 'A' && f.name === 'holiday.mp4') &&
-      cmp.groups[0].files.some(f => f.side === 'B' && f.name === 'holiday backup.mp4') &&
-      cmp.groups[0].verified === true;
+      cmp.a.withinWasted === 50000 && cmp.b.withinWasted === 0 &&
+      cross.files.some(f => f.side === 'A' && f.name === 'holiday.mp4') &&
+      cross.files.some(f => f.side === 'B' && f.name === 'holiday backup.mp4') &&
+      cross.verified === true;
     console.log(okCmp ? 'COMPARE OK' : 'COMPARE FAIL');
 
     app.exit(okSim && okDiff && okCmp ? 0 : 1);

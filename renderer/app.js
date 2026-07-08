@@ -44,7 +44,7 @@ const S = {
   largest: { category: null, query: '', rows: [] },
   similar: null,
   photoSelection: new Set(),
-  cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80 },
+  cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80, scope: 'cross' },
   scanning: false,
 };
 
@@ -1283,23 +1283,28 @@ function renderCompare() {
     return;
   }
 
+  const scoped = r.groups.filter(g => g.scope === C.scope);
   const selCount = C.selection.size;
   const selBytes = cmpSelectionBytes();
-  const shown = Math.min(C.shown, r.groups.length);
+  const shown = Math.min(C.shown, scoped.length);
+  const sc = r.scopeCounts;
 
   const statCard = (side, s, other) => `
     <div class="panel">
       <div class="cmp-stat-head">${sideChip(side)}<div class="cmp-stat-name" title="${esc(s.root)}">${esc(s.name)}</div></div>
       <div class="cmp-stat-line">${fmtBytes(s.bytes)} · ${fmtNum(s.files)} files${s.errors ? ` · ${fmtNum(s.errors)} unreadable` : ''}</div>
       <div class="cmp-stat-line"><strong>${fmtBytes(s.overlapBytes)}</strong> in ${fmtNum(s.overlapFiles)} files also exists in ${esc(other.name)}</div>
-      <div class="cmp-stat-line">${fmtBytes(Math.max(0, s.bytes - s.overlapBytes))} unique to this side</div>
+      <div class="cmp-stat-line">${fmtBytes(Math.max(0, s.bytes - s.overlapBytes))} unique to this side · ${s.withinWasted ? `<strong>${fmtBytes(s.withinWasted)}</strong> wasted in internal duplicates` : 'no internal duplicates'}</div>
     </div>`;
+
+  const scopeChip = (key, label, count) =>
+    `<button class="chip ${C.scope === key ? 'active' : ''}" data-scope="${key}">${label} (${fmtNum(count)})</button>`;
 
   el.innerHTML = `
     <div class="view-head">
       <div>
         <div class="view-title">Compare</div>
-        <div class="view-sub">${fmtNum(r.groupCount)} matching sets found${r.groupCount > r.shown ? ` · showing top ${r.shown}` : ''}</div>
+        <div class="view-sub">${fmtNum(r.groupCount)} duplicate sets across all scopes</div>
       </div>
       <button class="btn btn-ghost btn-small" id="btn-new-compare">New comparison</button>
     </div>
@@ -1309,27 +1314,46 @@ function renderCompare() {
       ${statCard('B', r.b, r.a)}
     </div>
 
+    <div class="filter-row">
+      ${scopeChip('cross', 'Across A ↔ B', sc.cross)}
+      ${scopeChip('a', 'Within A', sc.a)}
+      ${scopeChip('b', 'Within B', sc.b)}
+    </div>
+
     <div class="dupe-toolbar">
       <div class="dupe-toolbar-info"><strong>${fmtNum(selCount)}</strong> selected · <strong>${fmtBytes(selBytes)}</strong></div>
       <div class="dupe-toolbar-spacer"></div>
-      <button class="btn btn-ghost btn-small" id="btn-cmp-sel-a">Select all on ${sideChip('A')}</button>
-      <button class="btn btn-ghost btn-small" id="btn-cmp-sel-b">Select all on ${sideChip('B')}</button>
+      ${C.scope === 'cross'
+        ? `<button class="btn btn-ghost btn-small" id="btn-cmp-sel-a">Select all on ${sideChip('A')}</button>
+           <button class="btn btn-ghost btn-small" id="btn-cmp-sel-b">Select all on ${sideChip('B')}</button>`
+        : `<button class="btn btn-ghost btn-small" id="btn-cmp-auto">Auto-select (keep newest)</button>`}
       <button class="btn btn-ghost btn-small" id="btn-cmp-clear" ${selCount ? '' : 'disabled'}>Clear</button>
       <button class="btn btn-danger" id="btn-cmp-trash" ${selCount ? '' : 'disabled'}>${ICON_TRASH} Move ${selCount ? fmtNum(selCount) + ' files' : ''} to Trash</button>
     </div>
 
-    <div id="cmp-groups">${r.groups.slice(0, shown).map(cmpGroupHtml).join('')}</div>
-    ${r.groups.length > shown ? `<div style="text-align:center;padding:14px"><button class="btn btn-ghost" id="btn-cmp-more">Show ${Math.min(80, r.groups.length - shown)} more</button></div>` : ''}`;
+    <div id="cmp-groups">${scoped.slice(0, shown).map(cmpGroupHtml).join('') || '<div class="empty-note">No sets in this scope.</div>'}</div>
+    ${scoped.length > shown ? `<div style="text-align:center;padding:14px"><button class="btn btn-ghost" id="btn-cmp-more">Show ${Math.min(80, scoped.length - shown)} more</button></div>` : ''}`;
 
-  $('#btn-new-compare').addEventListener('click', () => { C.results = null; C.selection = new Set(); renderCompare(); });
+  $('#btn-new-compare').addEventListener('click', () => { C.results = null; C.selection = new Set(); C.scope = 'cross'; renderCompare(); });
+  el.querySelectorAll('[data-scope]').forEach(ch =>
+    ch.addEventListener('click', () => { C.scope = ch.dataset.scope; C.shown = 80; renderCompare(); }));
+
+  const selA = $('#btn-cmp-sel-a'), selB = $('#btn-cmp-sel-b'), auto = $('#btn-cmp-auto');
   const selectSide = side => {
-    for (const g of r.groups) for (const f of g.files) {
+    for (const g of scoped) for (const f of g.files) {
       if (f.side === side) C.selection.add(f.path);
     }
     renderCompare();
   };
-  $('#btn-cmp-sel-a').addEventListener('click', () => selectSide('A'));
-  $('#btn-cmp-sel-b').addEventListener('click', () => selectSide('B'));
+  if (selA) selA.addEventListener('click', () => selectSide('A'));
+  if (selB) selB.addEventListener('click', () => selectSide('B'));
+  if (auto) auto.addEventListener('click', () => {
+    for (const g of scoped) {
+      const newestFirst = [...g.files].sort((x, y) => y.mtime - x.mtime);
+      newestFirst.forEach((f, i) => { if (i === 0) C.selection.delete(f.path); else C.selection.add(f.path); });
+    }
+    renderCompare();
+  });
   $('#btn-cmp-clear').addEventListener('click', () => { C.selection.clear(); renderCompare(); });
   $('#btn-cmp-trash').addEventListener('click', trashSelectedCompare);
   const more = $('#btn-cmp-more');
@@ -1361,7 +1385,10 @@ function cmpGroupHtml(g) {
         <div class="file-chip" style="background:${catColor(g.category)}">${esc(extLabel(g.ext))}</div>
         <div class="dupe-group-title">${esc(g.files[0].name)}</div>
         <span class="badge ${g.verified ? 'badge-verified' : 'badge-sampled'}">${g.verified ? 'content verified' : 'sampled match'}</span>
-        <div class="dupe-group-meta">${fmtNum(g.countA)} on A · ${fmtNum(g.countB)} on B · ${fmtBytes(g.size)} each</div>
+        <div class="dupe-group-meta">${g.scope === 'cross'
+          ? `${fmtNum(g.countA)} on A · ${fmtNum(g.countB)} on B · ${fmtBytes(g.size)} each`
+          : `${fmtNum(g.count)} copies within ${g.scope.toUpperCase()} · ${fmtBytes(g.size)} each`}</div>
+        ${g.scope !== 'cross' ? `<div class="dupe-wasted">wastes ${fmtBytes(g.wasted)}</div>` : ''}
       </div>
       ${rows.map(f => `
         <div class="dupe-file">
@@ -1467,16 +1494,24 @@ async function trashSelectedCompare() {
     .map(g => {
       const files = g.files.filter(f => !gone.has(f.path));
       const countA = files.filter(f => f.side === 'A').length;
-      return { ...g, files, countA, countB: files.length - countA, count: files.length, bytes: g.size * files.length };
+      const countB = files.length - countA;
+      const scope = countA && countB ? 'cross' : countA > 1 ? 'a' : countB > 1 ? 'b' : 'dead';
+      return { ...g, files, countA, countB, scope, count: files.length, bytes: g.size * files.length, wasted: g.size * Math.max(0, files.length - 1) };
     })
-    .filter(g => g.countA > 0 && g.countB > 0);
+    .filter(g => g.scope !== 'dead');
+  const crossGroups = r.groups.filter(g => g.scope === 'cross');
   for (const side of ['a', 'b']) {
-    const label = side.toUpperCase();
-    r[side].overlapFiles = r.groups.reduce((s, g) => s + (label === 'A' ? g.countA : g.countB), 0);
-    r[side].overlapBytes = r.groups.reduce((s, g) => s + g.size * (label === 'A' ? g.countA : g.countB), 0);
+    const isA = side === 'a';
+    r[side].overlapFiles = crossGroups.reduce((s, g) => s + (isA ? g.countA : g.countB), 0);
+    r[side].overlapBytes = crossGroups.reduce((s, g) => s + g.size * (isA ? g.countA : g.countB), 0);
+    r[side].withinWasted = r.groups.filter(g => g.scope === side).reduce((s, g) => s + g.wasted, 0);
   }
+  r.scopeCounts = {
+    cross: crossGroups.length,
+    a: r.groups.filter(g => g.scope === 'a').length,
+    b: r.groups.filter(g => g.scope === 'b').length,
+  };
   r.groupCount = r.groups.length;
-  r.shown = r.groups.length;
   C.selection = new Set([...C.selection].filter(p => !gone.has(p)));
 
   if (res.failed.length) toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} failed (network drives may lack a Trash)`, false);

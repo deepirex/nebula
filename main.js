@@ -532,12 +532,20 @@ async function compareRoots(rootA, rootB) {
   const [a, b] = await Promise.all([collectFiles(rootA, 'A'), collectFiles(rootB, 'B')]);
   if (cmp.cancelled) { cmp.running = false; return null; }
 
-  // only sizes present on both sides can possibly match across them
-  const sizesA = new Set(a.files.filter(f => f.size > 0).map(f => f.size));
-  const sizesB = new Set(b.files.filter(f => f.size > 0).map(f => f.size));
-  const candidates = [];
-  for (const f of a.files) if (f.size > 0 && sizesB.has(f.size)) candidates.push({ f, side: 'A' });
-  for (const f of b.files) if (f.size > 0 && sizesA.has(f.size)) candidates.push({ f, side: 'B' });
+  // candidates: any size collision in the combined corpus — this lets one pass
+  // report matches across the sides AND duplicates within each side
+  const bySize = new Map();
+  const addSide = (files, side) => {
+    for (const f of files) {
+      if (f.size === 0) continue;
+      let arr = bySize.get(f.size);
+      if (!arr) bySize.set(f.size, arr = []);
+      arr.push({ f, side });
+    }
+  };
+  addSide(a.files, 'A');
+  addSide(b.files, 'B');
+  const candidates = [...bySize.values()].filter(arr => arr.length > 1).flat();
 
   const sem = new Semaphore(6);
   let done = 0, lastSent = 0;
@@ -568,7 +576,7 @@ async function compareRoots(rootA, rootB) {
   }
 
   const fullList = [...byQuick.values()]
-    .filter(arr => arr.length > 1 && arr.some(c => c.side === 'A') && arr.some(c => c.side === 'B'))
+    .filter(arr => arr.length > 1)
     .flat()
     .filter(c => c.f.size > QUICK_BYTES);
   done = 0; lastSent = 0;
@@ -599,18 +607,26 @@ async function compareRoots(rootA, rootB) {
 
   let groups = [];
   let id = 0, overlapA = 0, overlapB = 0, overlapFilesA = 0, overlapFilesB = 0;
+  let withinWastedA = 0, withinWastedB = 0;
   for (const [key, arr] of finalMap.entries()) {
+    if (arr.length < 2) continue;
     const countA = arr.filter(c => c.side === 'A').length;
     const countB = arr.length - countA;
-    if (!countA || !countB) continue; // must exist on both sides
     const size = arr[0].f.size;
-    overlapA += size * countA;
-    overlapB += size * countB;
-    overlapFilesA += countA;
-    overlapFilesB += countB;
+    // scope: on both sides → cross; multiple copies on one side only → within that side
+    let scope;
+    if (countA && countB) {
+      scope = 'cross';
+      overlapA += size * countA;
+      overlapB += size * countB;
+      overlapFilesA += countA;
+      overlapFilesB += countB;
+    } else if (countA > 1) { scope = 'a'; withinWastedA += size * (countA - 1); }
+    else { scope = 'b'; withinWastedB += size * (countB - 1); }
     groups.push({
-      id: id++, size, countA, countB, count: arr.length,
+      id: id++, size, countA, countB, count: arr.length, scope,
       bytes: size * arr.length,
+      wasted: size * (arr.length - 1),
       verified: !key.startsWith('S:'),
       ext: arr[0].f.ext,
       category: categoryOf(arr[0].f.ext),
@@ -620,14 +636,19 @@ async function compareRoots(rootA, rootB) {
     });
   }
   groups.sort((x, y) => y.bytes - x.bytes);
+  const scopeCounts = {
+    cross: groups.filter(g => g.scope === 'cross').length,
+    a: groups.filter(g => g.scope === 'a').length,
+    b: groups.filter(g => g.scope === 'b').length,
+  };
   const groupCount = groups.length;
-  groups = groups.slice(0, 400);
+  groups = groups.slice(0, 600);
 
   cmp.running = false;
   return {
-    a: { root: rootA, name: path.basename(rootA) || rootA, files: a.files.length, bytes: a.bytes, errors: a.errors, overlapBytes: overlapA, overlapFiles: overlapFilesA },
-    b: { root: rootB, name: path.basename(rootB) || rootB, files: b.files.length, bytes: b.bytes, errors: b.errors, overlapBytes: overlapB, overlapFiles: overlapFilesB },
-    groups, groupCount, shown: groups.length,
+    a: { root: rootA, name: path.basename(rootA) || rootA, files: a.files.length, bytes: a.bytes, errors: a.errors, overlapBytes: overlapA, overlapFiles: overlapFilesA, withinWasted: withinWastedA },
+    b: { root: rootB, name: path.basename(rootB) || rootB, files: b.files.length, bytes: b.bytes, errors: b.errors, overlapBytes: overlapB, overlapFiles: overlapFilesB, withinWasted: withinWastedB },
+    groups, groupCount, scopeCounts, shown: groups.length,
   };
 }
 
