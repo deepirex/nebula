@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file:;" />
   <title>Nebula — Storage Intelligence</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -42,6 +42,14 @@
         <button class="nav-item" data-view="largest" disabled>
           <svg viewBox="0 0 24 24"><path d="M4 20a1 1 0 0 1-1-1v-5h4v6H4Zm6 0v-10h4v10h-4Zm6 0V4h4v15a1 1 0 0 1-1 1h-3Z"/></svg>
           <span>Largest Files</span>
+        </button>
+        <button class="nav-item" data-view="photos" disabled>
+          <svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm3.5 4A2.5 2.5 0 1 0 11 9.5 2.5 2.5 0 0 0 8.5 7ZM5 19h14l-4.5-7-3.5 4.5-2-2.5L5 19Z"/></svg>
+          <span>Similar Photos</span>
+        </button>
+        <button class="nav-item" data-view="changes" disabled>
+          <svg viewBox="0 0 24 24"><path d="M3 17.5 9 11l4 4 7.3-8.2 1.4 1.3L13 18l-4-4-4.6 5H21v2H3v-3.5Z"/></svg>
+          <span>Changes</span>
         </button>
       </nav>
 
@@ -113,6 +121,12 @@
 
       <!-- Largest files -->
       <section id="view-largest" class="view" hidden></section>
+
+      <!-- Similar photos -->
+      <section id="view-photos" class="view" hidden></section>
+
+      <!-- Changes since last scan -->
+      <section id="view-changes" class="view" hidden></section>
     </main>
   </div>
 

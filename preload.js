@@ -19,9 +19,13 @@ contextBridge.exposeInMainWorld('nebula', {
   largest: (opts) => ipcRenderer.invoke('files:largest', opts),
   findDuplicates: () => ipcRenderer.invoke('dupes:find'),
   cancelDupes: () => ipcRenderer.invoke('dupes:cancel'),
+  findSimilarPhotos: () => ipcRenderer.invoke('photos:find'),
+  cancelPhotos: () => ipcRenderer.invoke('photos:cancel'),
+  diffGet: () => ipcRenderer.invoke('diff:get'),
   trash: (paths) => ipcRenderer.invoke('files:trash', paths),
   reveal: (p) => ipcRenderer.invoke('files:reveal', p),
   open: (p) => ipcRenderer.invoke('files:open', p),
   onScanProgress: (cb) => subscribe('scan:progress', cb),
   onDupeProgress: (cb) => subscribe('dupes:progress', cb),
+  onPhotoProgress: (cb) => subscribe('photos:progress', cb),
 });

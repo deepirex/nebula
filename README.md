@@ -19,6 +19,12 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
 - **Instant reopen** — every completed scan is saved to a compressed index, so
   the next launch offers "Resume last session" and restores the full dashboard
   in moments without rescanning.
+- **Similar Photos** — perceptual (dHash) fingerprinting clusters resized,
+  re-exported, and lightly edited versions of the same shot, with thumbnails.
+  Auto-select keeps the sharpest (highest-resolution) copy of each group.
+- **Changes** — every rescan is diffed against the previous snapshot of the
+  same folder: net change, biggest growing/shrinking folders, largest new and
+  grown files, and what was deleted.
 - **Largest Files** — top 150 by size with type filters, search, reveal, and
   trash actions.
 - Works across all file types and sizes; symlinks are never followed (no cycles,

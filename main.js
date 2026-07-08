@@ -1,5 +1,5 @@
 // Nebula — main process: window, filesystem scanning, duplicate detection, file ops.
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, nativeImage } = require('electron');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -26,6 +26,10 @@ const state = {
   dupeRunning: false,
   dupeCancelled: false,
   duplicates: null,     // { groups, totalWasted, ... }
+  photoRunning: false,
+  photoCancelled: false,
+  similar: null,        // { clusters, totalSavings, ... }
+  prevSnapshot: null,   // previous scan of the same root, for the Changes view
 };
 
 // ---------------------------------------------------------------- categories
@@ -471,6 +475,215 @@ async function findDuplicates() {
   return state.duplicates;
 }
 
+// ------------------------------------------------------- similar photos
+//
+// dHash (difference hash): decode with Electron's native image codec, shrink
+// to 9×8 grayscale, compare horizontal neighbours → 64-bit fingerprint.
+// Visually similar images (resized, re-exported, lightly edited) land within
+// a small Hamming distance of each other.
+
+const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif']);
+const CFG = { photoMinBytes: 10 * 1024 };
+const PHOTO_CAP = 30000;
+const HAM_THRESHOLD = 6;
+
+function pop32(x) {
+  x -= (x >> 1) & 0x55555555;
+  x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+  x = (x + (x >> 4)) & 0x0f0f0f0f;
+  return (x * 0x01010101) >> 24;
+}
+const hamming = (a, b) => pop32((a.hi ^ b.hi) >>> 0) + pop32((a.lo ^ b.lo) >>> 0);
+
+function dhashImage(img) {
+  if (!img || img.isEmpty()) return null;
+  const { width, height } = img.getSize();
+  const bmp = img.resize({ width: 9, height: 8, quality: 'good' }).toBitmap();
+  if (bmp.length < 9 * 8 * 4) return null;
+  const gray = new Float32Array(72);
+  for (let i = 0; i < 72; i++) {
+    const o = i * 4; // BGRA
+    gray[i] = 0.114 * bmp[o] + 0.587 * bmp[o + 1] + 0.299 * bmp[o + 2];
+  }
+  let hi = 0, lo = 0, bit = 0;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++, bit++) {
+      const i = y * 9 + x;
+      const b = gray[i] > gray[i + 1] ? 1 : 0;
+      if (bit < 32) hi = ((hi << 1) | b) >>> 0;
+      else lo = ((lo << 1) | b) >>> 0;
+    }
+  }
+  return { hi, lo, w: width, h: height };
+}
+
+async function findSimilarPhotos() {
+  state.photoRunning = true;
+  state.photoCancelled = false;
+
+  let images = state.files.filter(f => PHOTO_EXTS.has(f.ext) && f.size >= CFG.photoMinBytes);
+  let capped = false;
+  if (images.length > PHOTO_CAP) {
+    images = [...images].sort((a, b) => b.size - a.size).slice(0, PHOTO_CAP);
+    capped = true;
+  }
+
+  const items = [];
+  let done = 0, lastSent = 0;
+  for (const f of images) {
+    if (state.photoCancelled) { state.photoRunning = false; return null; }
+    try {
+      const h = dhashImage(nativeImage.createFromPath(f.path));
+      if (h) items.push({ f, h });
+    } catch { /* undecodable — skip */ }
+    done++;
+    const now = Date.now();
+    if (now - lastSent > 120) { lastSent = now; send('photos:progress', { done, total: images.length }); }
+    if (done % 8 === 0) await new Promise(r => setImmediate(r)); // keep IPC responsive
+  }
+  send('photos:progress', { done, total: images.length });
+
+  // Candidate pairing: split each hash into 8 bytes — two hashes within
+  // Hamming distance 7 must share at least one byte (pigeonhole), so we only
+  // compare within shared-byte buckets instead of all N².
+  const n = items.length;
+  const parent = new Int32Array(n);
+  for (let i = 0; i < n; i++) parent[i] = i;
+  const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra; };
+
+  const bandsOf = h => [
+    h.hi >>> 24 & 255, h.hi >>> 16 & 255, h.hi >>> 8 & 255, h.hi & 255,
+    h.lo >>> 24 & 255, h.lo >>> 16 & 255, h.lo >>> 8 & 255, h.lo & 255,
+  ];
+  const buckets = Array.from({ length: 8 }, () => new Map());
+  const BUCKET_CAP = 2000; // degenerate buckets (e.g. thousands of near-blank images) get skipped
+  for (let i = 0; i < n; i++) {
+    const bs = bandsOf(items[i].h);
+    for (let b = 0; b < 8; b++) {
+      let arr = buckets[b].get(bs[b]);
+      if (!arr) buckets[b].set(bs[b], arr = []);
+      arr.push(i);
+    }
+  }
+  const compared = new Set();
+  for (let b = 0; b < 8; b++) {
+    for (const arr of buckets[b].values()) {
+      if (arr.length < 2 || arr.length > BUCKET_CAP) continue;
+      for (let x = 0; x < arr.length; x++) {
+        for (let y = x + 1; y < arr.length; y++) {
+          const key = arr[x] * n + arr[y];
+          if (compared.has(key)) continue;
+          compared.add(key);
+          if (hamming(items[arr[x]].h, items[arr[y]].h) <= HAM_THRESHOLD) union(arr[x], arr[y]);
+        }
+      }
+    }
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = find(i);
+    let g = groups.get(r);
+    if (!g) groups.set(r, g = []);
+    g.push(i);
+  }
+  let clusters = [];
+  let id = 0;
+  for (const idxs of groups.values()) {
+    if (idxs.length < 2) continue;
+    let maxD = 0;
+    for (let x = 0; x < idxs.length && x < 12; x++)
+      for (let y = x + 1; y < idxs.length && y < 12; y++)
+        maxD = Math.max(maxD, hamming(items[idxs[x]].h, items[idxs[y]].h));
+    const files = idxs
+      .map(i => ({
+        path: items[i].f.path, name: items[i].f.name, dir: path.dirname(items[i].f.path),
+        size: items[i].f.size, mtime: items[i].f.mtime, w: items[i].h.w, h: items[i].h.h,
+      }))
+      .sort((a, b) => (b.w * b.h) - (a.w * a.h) || b.size - a.size); // best resolution first
+    const bytes = files.reduce((s, f) => s + f.size, 0);
+    clusters.push({ id: id++, files, count: files.length, bytes, savings: bytes - files[0].size, near: maxD <= 2 });
+  }
+  clusters.sort((a, b) => b.savings - a.savings);
+  const totalSavings = clusters.reduce((s, c) => s + c.savings, 0);
+  const clusterCount = clusters.length;
+  clusters = clusters.slice(0, 300);
+
+  state.similar = { clusters, clusterCount, totalSavings, scanned: images.length, capped };
+  state.photoRunning = false;
+  return state.similar;
+}
+
+// ------------------------------------------------------- changes (diff)
+
+async function capturePrevSnapshot(root) {
+  try {
+    const meta = JSON.parse(await fsp.readFile(indexPaths().meta, 'utf8'));
+    if (meta.v !== INDEX_VERSION || meta.root !== root) { state.prevSnapshot = null; return; }
+    const payload = JSON.parse((await gunzip(await fsp.readFile(indexPaths().data))).toString());
+    state.prevSnapshot = { savedAt: payload.savedAt, files: new Map(payload.files.map(([p, s]) => [p, s])) };
+  } catch {
+    state.prevSnapshot = null;
+  }
+}
+
+function computeDiff() {
+  if (!state.prevSnapshot || !state.rootNode) return null;
+  const prev = state.prevSnapshot;
+  const cur = new Map(state.files.map(f => [f.path, f.size]));
+
+  const dirDelta = new Map();
+  const bump = (p, d) => {
+    let dir = path.dirname(p);
+    while (true) {
+      dirDelta.set(dir, (dirDelta.get(dir) || 0) + d);
+      if (dir === state.root) break;
+      const up = path.dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  };
+
+  let addedBytes = 0, removedBytes = 0, grownBytes = 0, shrunkBytes = 0;
+  const newFiles = [], deletedFiles = [], changedFiles = [];
+  for (const [p, size] of cur) {
+    const old = prev.files.get(p);
+    if (old == null) { addedBytes += size; newFiles.push({ path: p, size }); bump(p, size); }
+    else if (old !== size) {
+      const d = size - old;
+      if (d > 0) grownBytes += d; else shrunkBytes -= d;
+      changedFiles.push({ path: p, delta: d, size });
+      bump(p, d);
+    }
+  }
+  for (const [p, size] of prev.files) {
+    if (!cur.has(p)) { removedBytes += size; deletedFiles.push({ path: p, size }); bump(p, -size); }
+  }
+
+  const sep = process.platform === 'win32' ? '\\' : '/';
+  const rootDepth = state.root.split(sep).length;
+  const dirs = [...dirDelta.entries()]
+    .filter(([p, d]) => d !== 0 && p !== state.root && p.split(sep).length <= rootDepth + 2)
+    .map(([p, d]) => ({ path: p, name: path.basename(p), delta: d }))
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+    .slice(0, 15);
+
+  const describe = f => ({ ...f, name: path.basename(f.path), dir: path.dirname(f.path) });
+  return {
+    prevAt: prev.savedAt,
+    net: addedBytes + grownBytes - removedBytes - shrunkBytes,
+    addedBytes, removedBytes, grownBytes, shrunkBytes,
+    addedCount: newFiles.length,
+    removedCount: deletedFiles.length,
+    changedCount: changedFiles.length,
+    dirs,
+    newFiles: newFiles.sort((a, b) => b.size - a.size).slice(0, 20).map(describe),
+    deletedFiles: deletedFiles.sort((a, b) => b.size - a.size).slice(0, 20).map(describe),
+    grownFiles: changedFiles.filter(f => f.delta > 0).sort((a, b) => b.delta - a.delta).slice(0, 20).map(describe),
+  };
+}
+
 // ------------------------------------------------------- index maintenance
 
 function removeFromIndex(filePath) {
@@ -537,6 +750,8 @@ ipcMain.handle('app:quickFolders', () => {
 ipcMain.handle('scan:start', async (_e, root) => {
   if (state.scanning) return { error: 'A scan is already running.' };
   try {
+    await capturePrevSnapshot(root); // keep the old index of this root for the Changes view
+    state.similar = null;
     const res = await runScan(root);
     if (!res.cancelled) saveIndex().catch(() => {});
     return res;
@@ -545,6 +760,21 @@ ipcMain.handle('scan:start', async (_e, root) => {
     return { error: String(err.message || err) };
   }
 });
+
+ipcMain.handle('photos:find', async () => {
+  if (state.photoRunning) return { error: 'Photo analysis is already running.' };
+  try {
+    const res = await findSimilarPhotos();
+    return res || { cancelled: true };
+  } catch (err) {
+    state.photoRunning = false;
+    return { error: String(err.message || err) };
+  }
+});
+
+ipcMain.handle('photos:cancel', () => { state.photoCancelled = true; return true; });
+
+ipcMain.handle('diff:get', () => computeDiff());
 
 ipcMain.handle('index:info', async () => {
   try {
@@ -629,6 +859,17 @@ ipcMain.handle('files:trash', async (_e, paths) => {
       state.duplicates.shown = state.duplicates.groups.length;
       state.duplicates.totalWasted = state.duplicates.groups.reduce((s, g) => s + g.wasted, 0);
     }
+    if (state.similar) {
+      state.similar.clusters = state.similar.clusters
+        .map(c => ({ ...c, files: c.files.filter(f => !gone.has(f.path)) }))
+        .filter(c => c.files.length > 1)
+        .map(c => {
+          const bytes = c.files.reduce((s, f) => s + f.size, 0);
+          return { ...c, count: c.files.length, bytes, savings: bytes - c.files[0].size };
+        });
+      state.similar.clusterCount = state.similar.clusters.length;
+      state.similar.totalSavings = state.similar.clusters.reduce((s, c) => s + c.savings, 0);
+    }
     scheduleSaveIndex();
   }
   return { trashed, failed };
@@ -666,10 +907,16 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  createWindow();
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  if (!process.env.NEBULA_NO_WINDOW) createWindow();
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0 && !process.env.NEBULA_NO_WINDOW) createWindow(); });
 });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+// Exposed for the headless test harness only.
+module.exports.__test = {
+  state, CFG, runScan, findDuplicates, findSimilarPhotos,
+  saveIndex, loadIndex, capturePrevSnapshot, computeDiff, dhashImage, hamming,
+};

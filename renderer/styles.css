@@ -465,6 +465,37 @@ body {
 
 .empty-note { text-align: center; color: var(--text-muted); padding: 44px 20px; font-size: 13px; }
 
+/* ============================================================ similar photos */
+.photo-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.photo-card {
+  position: relative; width: 138px; border-radius: 10px; overflow: hidden;
+  background: var(--surface-1); border: 1px solid var(--border);
+  transition: border-color 0.15s, transform 0.15s;
+}
+.photo-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+.photo-card.sel { border-color: rgba(230,103,103,0.6); box-shadow: 0 0 0 1px rgba(230,103,103,0.4); }
+.photo-card img { width: 138px; height: 104px; object-fit: cover; display: block; cursor: pointer; background: #10131a; }
+.photo-card input[type="checkbox"] {
+  position: absolute; top: 7px; left: 7px; width: 15px; height: 15px;
+  accent-color: #e66767; cursor: pointer;
+}
+.tag-best {
+  position: absolute; top: 7px; right: 7px;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 99px; background: rgba(12,163,12,0.85); color: #fff;
+}
+.photo-meta { font-size: 10.5px; color: var(--text-secondary); padding: 6px 8px 1px; font-variant-numeric: tabular-nums; }
+.photo-name { font-size: 10.5px; color: var(--text-muted); padding: 0 8px 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ============================================================ changes */
+.diff-row { display: grid; grid-template-columns: minmax(120px, 1.2fr) 2fr 96px; align-items: center; gap: 12px; padding: 6px 8px; border-radius: var(--radius-sm); }
+.diff-row:hover { background: var(--surface-2); }
+.diff-track { position: relative; height: 8px; border-radius: 4px; background: rgba(255,255,255,0.05); overflow: hidden; }
+.diff-fill-pos { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: #e66767; }
+.diff-fill-neg { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: #0ca30c; }
+.diff-delta-pos { color: #ff9d9d; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; font-size: 12px; }
+.diff-delta-neg { color: #6fdb6f; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; font-size: 12px; }
+
 /* ============================================================ tooltip */
 #tooltip {
   position: fixed; z-index: 100; pointer-events: none;

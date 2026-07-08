@@ -42,6 +42,8 @@ const S = {
   dupeExpanded: new Set(),
   dupeStrategy: 'smart',
   largest: { category: null, query: '', rows: [] },
+  similar: null,
+  photoSelection: new Set(),
   scanning: false,
 };
 
@@ -145,6 +147,8 @@ function setView(name) {
   if (name === 'storage') { if (!S.storageDir) S.storageDir = S.root; loadStorage(S.storageDir); }
   if (name === 'dupes') renderDupes();
   if (name === 'largest') refreshLargest();
+  if (name === 'photos') renderPhotos();
+  if (name === 'changes') renderChanges();
 }
 
 $$('.nav-item').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
@@ -162,6 +166,8 @@ async function startScan(root) {
   S.storageDir = null;
   S.dupes = null;
   S.dupeSelection = new Set();
+  S.similar = null;
+  S.photoSelection = new Set();
   $('#dupe-badge').hidden = true;
 
   setView('scanning');
@@ -920,6 +926,305 @@ async function trashSelectedDupes() {
   if (res.failed.length) toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} failed`, false);
   else toast(`Moved ${fmtNum(res.trashed.length)} files to Trash`);
   renderDupes();
+}
+
+// ------------------------------------------------------------- similar photos
+
+function fileUrl(p) {
+  const norm = api.platform === 'win32' ? '/' + p.replace(/\\/g, '/') : p;
+  return 'file://' + encodeURI(norm).replace(/#/g, '%23').replace(/\?/g, '%3F');
+}
+
+function renderPhotos() {
+  const el = $('#view-photos');
+
+  if (!S.similar) {
+    const imgCat = S.overview && S.overview.categories.find(c => c.key === 'Images');
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Similar Photos</div>
+        <div class="view-sub">Finds resized, re-exported, and lightly edited versions of the same shot — not just exact copies</div>
+      </div></div>
+      <div class="panel dupe-idle">
+        <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm3.5 4A2.5 2.5 0 1 0 11 9.5 2.5 2.5 0 0 0 8.5 7ZM5 19h14l-4.5-7-3.5 4.5-2-2.5L5 19Z"/></svg></div>
+        <h3>Find visually similar photos</h3>
+        <p>Nebula computes a perceptual fingerprint of every image and clusters ones that look alike, then recommends keeping the sharpest (highest-resolution) version of each.</p>
+        <button class="btn btn-primary" id="btn-run-photos">Analyze ${imgCat ? fmtNum(imgCat.count) + ' images' : 'images'}</button>
+      </div>`;
+    $('#btn-run-photos').addEventListener('click', runPhotoAnalysis);
+    return;
+  }
+
+  const sim = S.similar;
+  if (!sim.clusters.length) {
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Similar Photos</div>
+        <div class="view-sub">${fmtNum(sim.scanned)} images analyzed</div>
+      </div></div>
+      <div class="panel dupe-idle">
+        <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg></div>
+        <h3>No similar photos found</h3>
+        <p>Every analyzed image looks visually distinct.</p>
+        <button class="btn btn-ghost" id="btn-rerun-photos">Re-analyze</button>
+      </div>`;
+    $('#btn-rerun-photos').addEventListener('click', runPhotoAnalysis);
+    return;
+  }
+
+  const selCount = S.photoSelection.size;
+  const selBytes = photoSelectionBytes();
+
+  el.innerHTML = `
+    <div class="view-head"><div>
+      <div class="view-title">Similar Photos</div>
+      <div class="view-sub">${fmtNum(sim.clusterCount)} groups from ${fmtNum(sim.scanned)} images · up to <strong style="color:#ff9d9d">${fmtBytes(sim.totalSavings)}</strong> reclaimable${sim.capped ? ' · largest 30k images analyzed' : ''}</div>
+    </div></div>
+
+    <div class="dupe-toolbar">
+      <div class="dupe-toolbar-info"><strong>${fmtNum(selCount)}</strong> selected · <strong>${fmtBytes(selBytes)}</strong></div>
+      <div class="dupe-toolbar-spacer"></div>
+      <button class="btn btn-ghost btn-small" id="btn-photo-auto">Auto-select (keep sharpest)</button>
+      <button class="btn btn-ghost btn-small" id="btn-photo-clear" ${selCount ? '' : 'disabled'}>Clear</button>
+      <button class="btn btn-danger" id="btn-photo-trash" ${selCount ? '' : 'disabled'}>${ICON_TRASH} Move ${selCount ? fmtNum(selCount) + ' photos' : ''} to Trash</button>
+    </div>
+
+    <div id="photo-groups">${sim.clusters.map(photoClusterHtml).join('')}</div>`;
+
+  $('#btn-photo-auto').addEventListener('click', () => {
+    for (const c of sim.clusters) {
+      // files sorted best-resolution first; keep [0]
+      c.files.forEach((f, i) => { if (i === 0) S.photoSelection.delete(f.path); else S.photoSelection.add(f.path); });
+    }
+    renderPhotos();
+  });
+  $('#btn-photo-clear').addEventListener('click', () => { S.photoSelection.clear(); renderPhotos(); });
+  $('#btn-photo-trash').addEventListener('click', trashSelectedPhotos);
+
+  const groupsEl = $('#photo-groups');
+  groupsEl.addEventListener('change', e => {
+    const cb = e.target.closest('input[type="checkbox"]');
+    if (!cb) return;
+    if (cb.checked) S.photoSelection.add(cb.dataset.path);
+    else S.photoSelection.delete(cb.dataset.path);
+    cb.closest('.photo-card').classList.toggle('sel', cb.checked);
+    renderPhotoToolbar();
+  });
+  groupsEl.addEventListener('click', e => {
+    const img = e.target.closest('img');
+    if (img) api.reveal(img.dataset.path);
+  });
+}
+
+function photoClusterHtml(c) {
+  return `
+    <div class="panel dupe-group">
+      <div class="dupe-group-head">
+        <div class="dupe-group-title">${esc(c.files[0].name)}</div>
+        <span class="badge ${c.near ? 'badge-verified' : 'badge-sampled'}">${c.near ? 'near-identical' : 'similar'}</span>
+        <div class="dupe-group-meta">${fmtNum(c.count)} photos · ${fmtBytes(c.bytes)}</div>
+        <div class="dupe-wasted">save up to ${fmtBytes(c.savings)}</div>
+      </div>
+      <div class="photo-grid">
+        ${c.files.map((f, i) => `
+          <div class="photo-card ${S.photoSelection.has(f.path) ? 'sel' : ''}">
+            <img src="${fileUrl(f.path)}" data-path="${esc(f.path)}" loading="lazy" title="${esc(f.path)} — click to reveal">
+            <input type="checkbox" data-path="${esc(f.path)}" ${S.photoSelection.has(f.path) ? 'checked' : ''}>
+            ${i === 0 ? '<span class="tag-best">best</span>' : ''}
+            <div class="photo-meta">${f.w}×${f.h} · ${fmtBytes(f.size)}</div>
+            <div class="photo-name" title="${esc(f.dir)}">${esc(f.name)}</div>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+function photoSelectionBytes() {
+  if (!S.similar) return 0;
+  let bytes = 0;
+  for (const c of S.similar.clusters)
+    for (const f of c.files)
+      if (S.photoSelection.has(f.path)) bytes += f.size;
+  return bytes;
+}
+
+function renderPhotoToolbar() {
+  const info = document.querySelector('#view-photos .dupe-toolbar-info');
+  if (info) info.innerHTML = `<strong>${fmtNum(S.photoSelection.size)}</strong> selected · <strong>${fmtBytes(photoSelectionBytes())}</strong>`;
+  const trashBtn = $('#btn-photo-trash'), clearBtn = $('#btn-photo-clear');
+  if (trashBtn) {
+    trashBtn.disabled = !S.photoSelection.size;
+    trashBtn.innerHTML = `${ICON_TRASH} Move ${S.photoSelection.size ? fmtNum(S.photoSelection.size) + ' photos' : ''} to Trash`;
+  }
+  if (clearBtn) clearBtn.disabled = !S.photoSelection.size;
+}
+
+async function runPhotoAnalysis() {
+  const el = $('#view-photos');
+  el.innerHTML = `
+    <div class="view-head"><div>
+      <div class="view-title">Similar Photos</div>
+      <div class="view-sub">Computing perceptual fingerprints…</div>
+    </div></div>
+    <div class="dupe-progress">
+      <div class="dupe-progress-label" id="photo-phase">Preparing…</div>
+      <div class="progress-track"><div class="progress-fill" id="photo-fill" style="width:2%"></div></div>
+      <button class="btn btn-ghost" id="btn-cancel-photos">Cancel</button>
+    </div>`;
+  $('#btn-cancel-photos').addEventListener('click', () => api.cancelPhotos());
+
+  const res = await api.findSimilarPhotos();
+  if (res && res.error) { toast(res.error, false); S.similar = null; renderPhotos(); return; }
+  if (res && res.cancelled) { toast('Photo analysis cancelled'); S.similar = null; renderPhotos(); return; }
+  S.similar = res;
+  S.photoSelection = new Set();
+  renderPhotos();
+}
+
+api.onPhotoProgress(p => {
+  const phase = $('#photo-phase'), fill = $('#photo-fill');
+  if (!phase || !fill) return;
+  phase.textContent = `Fingerprinting ${fmtNum(p.total)} images (${fmtNum(p.done)} done)`;
+  fill.style.width = `${p.total ? ((p.done / p.total) * 100).toFixed(1) : 100}%`;
+});
+
+async function trashSelectedPhotos() {
+  const paths = [...S.photoSelection];
+  if (!paths.length) return;
+  const ok = await confirmModal({
+    title: 'Move photos to Trash?',
+    body: `<strong>${fmtNum(paths.length)} photos</strong> (${esc(fmtBytes(photoSelectionBytes()))}) will be moved to the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}. The best version of each group stays untouched.`,
+    confirmLabel: 'Move to Trash',
+    danger: true,
+  });
+  if (!ok) return;
+
+  const res = await api.trash(paths);
+  const gone = new Set(res.trashed);
+  S.similar.clusters = S.similar.clusters
+    .map(c => ({ ...c, files: c.files.filter(f => !gone.has(f.path)) }))
+    .filter(c => c.files.length > 1)
+    .map(c => {
+      const bytes = c.files.reduce((s, f) => s + f.size, 0);
+      return { ...c, count: c.files.length, bytes, savings: bytes - c.files[0].size };
+    });
+  S.similar.clusterCount = S.similar.clusters.length;
+  S.similar.totalSavings = S.similar.clusters.reduce((s, c) => s + c.savings, 0);
+  S.photoSelection = new Set([...S.photoSelection].filter(p => !gone.has(p)));
+
+  if (res.failed.length) toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} failed`, false);
+  else toast(`Moved ${fmtNum(res.trashed.length)} photos to Trash`);
+  renderPhotos();
+}
+
+// ------------------------------------------------------------- changes (diff)
+
+async function renderChanges() {
+  const el = $('#view-changes');
+  const d = await api.diffGet();
+
+  if (!d) {
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Changes</div>
+        <div class="view-sub">See exactly what grew, shrank, appeared, and disappeared between scans</div>
+      </div></div>
+      <div class="panel dupe-idle">
+        <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M3 17.5 9 11l4 4 7.3-8.2 1.4 1.3L13 18l-4-4-4.6 5H21v2H3v-3.5Z"/></svg></div>
+        <h3>No comparison point yet</h3>
+        <p>Nebula snapshots every completed scan. Rescan this folder — now or any time later — and this view will show precisely where new storage went.</p>
+        <button class="btn btn-primary" id="btn-diff-rescan">Rescan now</button>
+      </div>`;
+    $('#btn-diff-rescan').addEventListener('click', () => { if (S.root) startScan(S.root); });
+    return;
+  }
+
+  const net = d.net;
+  const netParts = fmtBytesParts(Math.abs(net));
+  const maxDir = Math.max(...d.dirs.map(x => Math.abs(x.delta)), 1);
+
+  el.innerHTML = `
+    <div class="view-head"><div>
+      <div class="view-title">Changes</div>
+      <div class="view-sub">Since ${esc(fmtDate(d.prevAt))} at ${esc(new Date(d.prevAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }))}</div>
+    </div></div>
+
+    <div class="kpi-row">
+      <div class="kpi">
+        <div class="kpi-label">Net change</div>
+        <div class="kpi-value" style="color:${net > 0 ? '#ff9d9d' : net < 0 ? '#6fdb6f' : 'inherit'}">${net > 0 ? '+' : net < 0 ? '−' : ''}${netParts.num}<small>${netParts.unit}</small></div>
+        <div class="kpi-sub">${net >= 0 ? 'more' : 'less'} storage used than last scan</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Added</div>
+        <div class="kpi-value">${fmtBytesParts(d.addedBytes).num}<small>${fmtBytesParts(d.addedBytes).unit}</small></div>
+        <div class="kpi-sub">${fmtNum(d.addedCount)} new files</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Removed</div>
+        <div class="kpi-value">${fmtBytesParts(d.removedBytes).num}<small>${fmtBytesParts(d.removedBytes).unit}</small></div>
+        <div class="kpi-sub">${fmtNum(d.removedCount)} files deleted</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Grew in place</div>
+        <div class="kpi-value">${fmtBytesParts(d.grownBytes).num}<small>${fmtBytesParts(d.grownBytes).unit}</small></div>
+        <div class="kpi-sub">${fmtNum(d.changedCount)} files changed size</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:14px">
+      <div class="panel-title">Where it changed <span class="panel-hint">red grew · green shrank · click to explore</span></div>
+      <div class="bar-list" id="diff-dirs">
+        ${d.dirs.map((x, i) => `
+          <div class="diff-row" data-i="${i}" title="${esc(x.path)}" style="cursor:pointer">
+            <div class="bar-row-name">${ICON_FOLDER}<span>${esc(x.name)}</span></div>
+            <div class="diff-track"><div class="${x.delta > 0 ? 'diff-fill-pos' : 'diff-fill-neg'}" style="width:${((Math.abs(x.delta) / maxDir) * 100).toFixed(1)}%"></div></div>
+            <div class="${x.delta > 0 ? 'diff-delta-pos' : 'diff-delta-neg'}">${x.delta > 0 ? '+' : '−'}${fmtBytes(Math.abs(x.delta))}</div>
+          </div>`).join('') || '<div class="empty-note">No folder-level changes.</div>'}
+      </div>
+    </div>
+
+    <div class="dash-grid-2">
+      <div class="panel">
+        <div class="panel-title">Biggest new & grown files <span class="panel-hint">click to reveal</span></div>
+        <div id="diff-new">
+          ${[...d.newFiles.map(f => ({ ...f, delta: f.size, tag: 'new' })), ...d.grownFiles.map(f => ({ ...f, tag: 'grew' }))]
+            .sort((a, b) => b.delta - a.delta).slice(0, 15).map(f => `
+            <div class="file-row" data-path="${esc(f.path)}" title="${esc(f.path)}">
+              <div class="file-chip" style="background:${f.tag === 'new' ? '#e66767' : '#c98500'}">${f.tag.toUpperCase()}</div>
+              <div class="file-row-main">
+                <div class="file-row-name">${esc(f.name)}</div>
+                <div class="file-row-path">${esc(f.dir)}</div>
+              </div>
+              <div class="file-row-size" style="color:#ff9d9d">+${fmtBytes(f.delta)}</div>
+            </div>`).join('') || '<div class="empty-note">Nothing new or grown.</div>'}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Deleted files</div>
+        <div>
+          ${d.deletedFiles.slice(0, 15).map(f => `
+            <div class="file-row" style="cursor:default" title="${esc(f.path)}">
+              <div class="file-chip" style="background:#3a4152">GONE</div>
+              <div class="file-row-main">
+                <div class="file-row-name">${esc(f.name)}</div>
+                <div class="file-row-path">${esc(f.dir)}</div>
+              </div>
+              <div class="file-row-size" style="color:#6fdb6f">−${fmtBytes(f.size)}</div>
+            </div>`).join('') || '<div class="empty-note">Nothing deleted.</div>'}
+        </div>
+      </div>
+    </div>`;
+
+  $('#diff-dirs').addEventListener('click', e => {
+    const row = e.target.closest('.diff-row');
+    if (!row) return;
+    const x = d.dirs[+row.dataset.i];
+    if (x) { S.storageDir = x.path; setView('storage'); }
+  });
+  $('#diff-new').addEventListener('click', e => {
+    const row = e.target.closest('.file-row');
+    if (row && row.dataset.path) api.reveal(row.dataset.path);
+  });
 }
 
 // ------------------------------------------------------------- largest files
