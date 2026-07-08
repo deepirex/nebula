@@ -44,6 +44,7 @@ const S = {
   largest: { category: null, query: '', rows: [] },
   similar: null,
   photoSelection: new Set(),
+  cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80 },
   scanning: false,
 };
 
@@ -149,6 +150,7 @@ function setView(name) {
   if (name === 'largest') refreshLargest();
   if (name === 'photos') renderPhotos();
   if (name === 'changes') renderChanges();
+  if (name === 'compare') renderCompare();
 }
 
 $$('.nav-item').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
@@ -1225,6 +1227,261 @@ async function renderChanges() {
     const row = e.target.closest('.file-row');
     if (row && row.dataset.path) api.reveal(row.dataset.path);
   });
+}
+
+// ------------------------------------------------------------- compare
+
+const sideChip = s => `<span class="side-chip side-${s.toLowerCase()}">${s}</span>`;
+
+function renderCompare() {
+  const el = $('#view-compare');
+  const C = S.cmp;
+
+  if (!C.results) {
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Compare</div>
+        <div class="view-sub">Content-match two folders or drives — find what's duplicated across them and what's unique to each</div>
+      </div></div>
+      <div class="cmp-setup">
+        <div class="cmp-pick ${C.a ? 'filled' : ''}" id="cmp-pick-a">
+          <span class="side-tag" style="color:#6ea6ec">SIDE A</span>
+          ${C.a ? `<div class="cmp-path">${esc(C.a)}</div><div class="cmp-hint">click to change</div>`
+              : `<div class="cmp-path">Choose folder or drive…</div><div class="cmp-hint">e.g. your main library</div>`}
+        </div>
+        <div class="cmp-vs">VS</div>
+        <div class="cmp-pick ${C.b ? 'filled' : ''}" id="cmp-pick-b">
+          <span class="side-tag" style="color:#a99ef0">SIDE B</span>
+          ${C.b ? `<div class="cmp-path">${esc(C.b)}</div><div class="cmp-hint">click to change</div>`
+              : `<div class="cmp-path">Choose folder or drive…</div><div class="cmp-hint">e.g. an external or network drive</div>`}
+        </div>
+      </div>
+      <div style="text-align:center">
+        <button class="btn btn-primary btn-large" id="btn-run-compare" ${C.a && C.b ? '' : 'disabled'}>Compare contents</button>
+        <div class="quick-label" style="margin-top:14px">both sides are scanned fresh — works across internal, external, and network drives</div>
+      </div>`;
+    $('#cmp-pick-a').addEventListener('click', async () => { const p = await api.pickFolder(); if (p) { C.a = p; renderCompare(); } });
+    $('#cmp-pick-b').addEventListener('click', async () => { const p = await api.pickFolder(); if (p) { C.b = p; renderCompare(); } });
+    $('#btn-run-compare').addEventListener('click', runCompare);
+    return;
+  }
+
+  const r = C.results;
+  if (!r.groups.length) {
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Compare</div>
+        <div class="view-sub">${esc(r.a.name)} vs ${esc(r.b.name)}</div>
+      </div></div>
+      <div class="panel dupe-idle">
+        <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg></div>
+        <h3>No overlap found</h3>
+        <p>Nothing in <strong>${esc(r.a.name)}</strong> (${fmtNum(r.a.files)} files) shares content with <strong>${esc(r.b.name)}</strong> (${fmtNum(r.b.files)} files). The two locations are fully distinct.</p>
+        <button class="btn btn-ghost" id="btn-new-compare">Compare different folders</button>
+      </div>`;
+    $('#btn-new-compare').addEventListener('click', () => { C.results = null; C.selection = new Set(); renderCompare(); });
+    return;
+  }
+
+  const selCount = C.selection.size;
+  const selBytes = cmpSelectionBytes();
+  const shown = Math.min(C.shown, r.groups.length);
+
+  const statCard = (side, s, other) => `
+    <div class="panel">
+      <div class="cmp-stat-head">${sideChip(side)}<div class="cmp-stat-name" title="${esc(s.root)}">${esc(s.name)}</div></div>
+      <div class="cmp-stat-line">${fmtBytes(s.bytes)} · ${fmtNum(s.files)} files${s.errors ? ` · ${fmtNum(s.errors)} unreadable` : ''}</div>
+      <div class="cmp-stat-line"><strong>${fmtBytes(s.overlapBytes)}</strong> in ${fmtNum(s.overlapFiles)} files also exists in ${esc(other.name)}</div>
+      <div class="cmp-stat-line">${fmtBytes(Math.max(0, s.bytes - s.overlapBytes))} unique to this side</div>
+    </div>`;
+
+  el.innerHTML = `
+    <div class="view-head">
+      <div>
+        <div class="view-title">Compare</div>
+        <div class="view-sub">${fmtNum(r.groupCount)} matching sets found${r.groupCount > r.shown ? ` · showing top ${r.shown}` : ''}</div>
+      </div>
+      <button class="btn btn-ghost btn-small" id="btn-new-compare">New comparison</button>
+    </div>
+
+    <div class="cmp-stats">
+      ${statCard('A', r.a, r.b)}
+      ${statCard('B', r.b, r.a)}
+    </div>
+
+    <div class="dupe-toolbar">
+      <div class="dupe-toolbar-info"><strong>${fmtNum(selCount)}</strong> selected · <strong>${fmtBytes(selBytes)}</strong></div>
+      <div class="dupe-toolbar-spacer"></div>
+      <button class="btn btn-ghost btn-small" id="btn-cmp-sel-a">Select all on ${sideChip('A')}</button>
+      <button class="btn btn-ghost btn-small" id="btn-cmp-sel-b">Select all on ${sideChip('B')}</button>
+      <button class="btn btn-ghost btn-small" id="btn-cmp-clear" ${selCount ? '' : 'disabled'}>Clear</button>
+      <button class="btn btn-danger" id="btn-cmp-trash" ${selCount ? '' : 'disabled'}>${ICON_TRASH} Move ${selCount ? fmtNum(selCount) + ' files' : ''} to Trash</button>
+    </div>
+
+    <div id="cmp-groups">${r.groups.slice(0, shown).map(cmpGroupHtml).join('')}</div>
+    ${r.groups.length > shown ? `<div style="text-align:center;padding:14px"><button class="btn btn-ghost" id="btn-cmp-more">Show ${Math.min(80, r.groups.length - shown)} more</button></div>` : ''}`;
+
+  $('#btn-new-compare').addEventListener('click', () => { C.results = null; C.selection = new Set(); renderCompare(); });
+  const selectSide = side => {
+    for (const g of r.groups) for (const f of g.files) {
+      if (f.side === side) C.selection.add(f.path);
+    }
+    renderCompare();
+  };
+  $('#btn-cmp-sel-a').addEventListener('click', () => selectSide('A'));
+  $('#btn-cmp-sel-b').addEventListener('click', () => selectSide('B'));
+  $('#btn-cmp-clear').addEventListener('click', () => { C.selection.clear(); renderCompare(); });
+  $('#btn-cmp-trash').addEventListener('click', trashSelectedCompare);
+  const more = $('#btn-cmp-more');
+  if (more) more.addEventListener('click', () => { C.shown += 80; renderCompare(); });
+
+  $('#cmp-groups').addEventListener('change', e => {
+    const cb = e.target.closest('input[type="checkbox"]');
+    if (!cb) return;
+    if (cb.checked) C.selection.add(cb.dataset.path);
+    else C.selection.delete(cb.dataset.path);
+    renderCmpToolbar();
+  });
+  $('#cmp-groups').addEventListener('click', e => {
+    const ex = e.target.closest('[data-expand]');
+    if (ex) { C.expanded.add(+ex.dataset.expand); renderCompare(); return; }
+    const p = e.target.closest('.dupe-file-path');
+    if (p) api.reveal(p.dataset.path);
+  });
+}
+
+function cmpGroupHtml(g) {
+  const C = S.cmp;
+  const expanded = C.expanded.has(g.id);
+  const rows = expanded ? g.files : g.files.slice(0, 8);
+  const hiddenCount = g.files.length - rows.length;
+  return `
+    <div class="panel dupe-group">
+      <div class="dupe-group-head">
+        <div class="file-chip" style="background:${catColor(g.category)}">${esc(extLabel(g.ext))}</div>
+        <div class="dupe-group-title">${esc(g.files[0].name)}</div>
+        <span class="badge ${g.verified ? 'badge-verified' : 'badge-sampled'}">${g.verified ? 'content verified' : 'sampled match'}</span>
+        <div class="dupe-group-meta">${fmtNum(g.countA)} on A · ${fmtNum(g.countB)} on B · ${fmtBytes(g.size)} each</div>
+      </div>
+      ${rows.map(f => `
+        <div class="dupe-file">
+          <input type="checkbox" data-path="${esc(f.path)}" ${C.selection.has(f.path) ? 'checked' : ''}>
+          ${sideChip(f.side)}
+          <div class="dupe-file-name">${esc(f.name)}</div>
+          <div class="dupe-file-path" data-path="${esc(f.path)}" title="Reveal">${esc(f.dir)}</div>
+          <div class="dupe-file-date">${fmtDate(f.mtime)}</div>
+        </div>`).join('')}
+      ${hiddenCount > 0 ? `<div class="dupe-expand"><button class="btn btn-ghost btn-small" data-expand="${g.id}">Show all ${fmtNum(g.files.length)} copies</button></div>` : ''}
+    </div>`;
+}
+
+function cmpSelectionBytes() {
+  const C = S.cmp;
+  if (!C.results) return 0;
+  let bytes = 0;
+  for (const g of C.results.groups)
+    for (const f of g.files)
+      if (C.selection.has(f.path)) bytes += g.size;
+  return bytes;
+}
+
+function renderCmpToolbar() {
+  const C = S.cmp;
+  const info = document.querySelector('#view-compare .dupe-toolbar-info');
+  if (info) info.innerHTML = `<strong>${fmtNum(C.selection.size)}</strong> selected · <strong>${fmtBytes(cmpSelectionBytes())}</strong>`;
+  const trashBtn = $('#btn-cmp-trash'), clearBtn = $('#btn-cmp-clear');
+  if (trashBtn) {
+    trashBtn.disabled = !C.selection.size;
+    trashBtn.innerHTML = `${ICON_TRASH} Move ${C.selection.size ? fmtNum(C.selection.size) + ' files' : ''} to Trash`;
+  }
+  if (clearBtn) clearBtn.disabled = !C.selection.size;
+}
+
+async function runCompare() {
+  const C = S.cmp;
+  const el = $('#view-compare');
+  el.innerHTML = `
+    <div class="view-head"><div>
+      <div class="view-title">Compare</div>
+      <div class="view-sub">${esc(C.a)} vs ${esc(C.b)}</div>
+    </div></div>
+    <div class="dupe-progress">
+      <div class="dupe-progress-label" id="cmp-phase">Scanning both sides…</div>
+      <div class="dupe-progress-label" id="cmp-sides" style="font-variant-numeric:tabular-nums"></div>
+      <div class="progress-track"><div class="progress-fill" id="cmp-fill" style="width:2%"></div></div>
+      <button class="btn btn-ghost" id="btn-cancel-cmp">Cancel</button>
+    </div>`;
+  $('#btn-cancel-cmp').addEventListener('click', () => api.compareCancel());
+
+  const sideStats = { A: { files: 0, bytes: 0 }, B: { files: 0, bytes: 0 } };
+  window.__cmpSides = sideStats; // updated by the progress listener below
+
+  const res = await api.compareRun(C.a, C.b);
+  if (res && res.error) { toast(res.error, false); C.results = null; renderCompare(); return; }
+  if (res && res.cancelled) { toast('Comparison cancelled'); C.results = null; renderCompare(); return; }
+  C.results = res;
+  C.selection = new Set();
+  C.expanded = new Set();
+  C.shown = 80;
+  renderCompare();
+}
+
+api.onCompareProgress(p => {
+  const phase = $('#cmp-phase'), fill = $('#cmp-fill'), sides = $('#cmp-sides');
+  if (!phase || !fill) return;
+  if (p.phase === 'scan') {
+    const st = window.__cmpSides;
+    if (st && p.side) { st[p.side] = { files: p.files, bytes: p.bytes }; }
+    phase.textContent = 'Scanning both sides…';
+    if (sides && st) sides.textContent = `A: ${fmtNum(st.A.files)} files · ${fmtBytes(st.A.bytes)}     B: ${fmtNum(st.B.files)} files · ${fmtBytes(st.B.bytes)}`;
+    fill.style.width = '8%';
+  } else if (p.phase === 'quick') {
+    phase.textContent = `Fingerprinting ${fmtNum(p.total)} size-matched candidates (${fmtNum(p.done)} done)`;
+    fill.style.width = `${(10 + (p.total ? p.done / p.total : 1) * 40).toFixed(1)}%`;
+  } else {
+    phase.textContent = `Verifying content of ${fmtNum(p.total)} files (${fmtNum(p.done)} done)`;
+    fill.style.width = `${(50 + (p.total ? p.done / p.total : 1) * 50).toFixed(1)}%`;
+  }
+});
+
+async function trashSelectedCompare() {
+  const C = S.cmp;
+  const paths = [...C.selection];
+  if (!paths.length) return;
+
+  // warn if any set would lose every copy on both sides
+  const doomed = C.results.groups.filter(g => g.files.length && g.files.every(f => C.selection.has(f.path))).length;
+  const ok = await confirmModal({
+    title: 'Move to Trash?',
+    body: `<strong>${fmtNum(paths.length)} files</strong> (${esc(fmtBytes(cmpSelectionBytes()))}) will be moved to the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}.` +
+      (doomed ? `<br><br>⚠ In <strong>${fmtNum(doomed)} sets every copy on both sides is selected</strong> — those files would remain only in the Trash. Consider keeping one side.` : ''),
+    confirmLabel: 'Move to Trash',
+    danger: true,
+  });
+  if (!ok) return;
+
+  const res = await api.trash(paths);
+  const gone = new Set(res.trashed);
+  const r = C.results;
+  r.groups = r.groups
+    .map(g => {
+      const files = g.files.filter(f => !gone.has(f.path));
+      const countA = files.filter(f => f.side === 'A').length;
+      return { ...g, files, countA, countB: files.length - countA, count: files.length, bytes: g.size * files.length };
+    })
+    .filter(g => g.countA > 0 && g.countB > 0);
+  for (const side of ['a', 'b']) {
+    const label = side.toUpperCase();
+    r[side].overlapFiles = r.groups.reduce((s, g) => s + (label === 'A' ? g.countA : g.countB), 0);
+    r[side].overlapBytes = r.groups.reduce((s, g) => s + g.size * (label === 'A' ? g.countA : g.countB), 0);
+  }
+  r.groupCount = r.groups.length;
+  r.shown = r.groups.length;
+  C.selection = new Set([...C.selection].filter(p => !gone.has(p)));
+
+  if (res.failed.length) toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} failed (network drives may lack a Trash)`, false);
+  else toast(`Moved ${fmtNum(res.trashed.length)} files to Trash`);
+  renderCompare();
 }
 
 // ------------------------------------------------------------- largest files

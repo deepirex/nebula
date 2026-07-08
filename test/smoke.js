@@ -65,7 +65,29 @@ app.whenReady().then(async () => {
       diff.grownBytes === 10000 && diff.net === 50000 - diff.removedBytes + 10000;
     console.log(okDiff ? 'DIFF OK' : 'DIFF FAIL');
 
-    app.exit(okSim && okDiff ? 0 : 1);
+    // --- compare: two roots sharing one file's content
+    const ca = path.join(work, 'cmpA'), cb = path.join(work, 'cmpB', 'nested');
+    fs.rmSync(path.join(work, 'cmpA'), { recursive: true, force: true });
+    fs.rmSync(path.join(work, 'cmpB'), { recursive: true, force: true });
+    fs.mkdirSync(ca, { recursive: true });
+    fs.mkdirSync(cb, { recursive: true });
+    const shared = Buffer.alloc(200000, 42);
+    fs.writeFileSync(path.join(ca, 'holiday.mp4'), shared);
+    fs.writeFileSync(path.join(ca, 'only_a.bin'), Buffer.alloc(50000, 1));
+    fs.writeFileSync(path.join(cb, 'holiday backup.mp4'), shared);          // same content, different name
+    fs.writeFileSync(path.join(cb, 'same_size_diff.bin'), Buffer.alloc(50000, 9)); // same size as only_a, different bytes
+    const cmp = await t.compareRoots(path.join(work, 'cmpA'), path.join(work, 'cmpB'));
+    console.log('COMPARE groups=%d overlapA=%d overlapB=%d filesA=%d filesB=%d',
+      cmp.groupCount, cmp.a.overlapBytes, cmp.b.overlapBytes, cmp.a.files, cmp.b.files);
+    for (const g of cmp.groups) console.log('  set:', g.files.map(f => `${f.side}:${f.name}`).join(' | '), 'verified=', g.verified);
+    const okCmp = cmp.groupCount === 1 &&
+      cmp.a.overlapBytes === 200000 && cmp.b.overlapBytes === 200000 &&
+      cmp.groups[0].files.some(f => f.side === 'A' && f.name === 'holiday.mp4') &&
+      cmp.groups[0].files.some(f => f.side === 'B' && f.name === 'holiday backup.mp4') &&
+      cmp.groups[0].verified === true;
+    console.log(okCmp ? 'COMPARE OK' : 'COMPARE FAIL');
+
+    app.exit(okSim && okDiff && okCmp ? 0 : 1);
   } catch (e) {
     console.error('FAIL', e);
     app.exit(1);

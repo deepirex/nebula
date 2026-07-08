@@ -25,6 +25,9 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
 - **Changes** — every rescan is diffed against the previous snapshot of the
   same folder: net change, biggest growing/shrinking folders, largest new and
   grown files, and what was deleted.
+- **Compare** — content-match any two folders or drives (internal, external,
+  or network): what's duplicated across both sides regardless of filename,
+  what's unique to each, with per-side bulk selection to clear one copy.
 - **Largest Files** — top 150 by size with type filters, search, reveal, and
   trash actions.
 - Works across all file types and sizes; symlinks are never followed (no cycles,

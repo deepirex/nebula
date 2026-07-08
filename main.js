@@ -475,6 +475,162 @@ async function findDuplicates() {
   return state.duplicates;
 }
 
+// ------------------------------------------------------- compare two roots
+//
+// Scans two folders (any drives) in parallel, then content-matches files
+// across them with the same size → quick-hash → full-hash pipeline as the
+// duplicate finder. Only groups with copies on BOTH sides are reported.
+
+const cmp = { running: false, cancelled: false };
+
+async function collectFiles(root, sideLabel) {
+  const files = [];
+  let errors = 0, bytes = 0, lastSent = 0;
+  const sem = new Semaphore(32);
+  async function walk(dirPath) {
+    if (cmp.cancelled) return;
+    let entries;
+    await sem.acquire();
+    try { entries = await fsp.readdir(dirPath, { withFileTypes: true }); }
+    catch { errors++; return; }
+    finally { sem.release(); }
+    const dirEnts = [], fileEnts = [];
+    for (const ent of entries) {
+      if (ent.isSymbolicLink()) continue;
+      if (ent.isDirectory()) dirEnts.push(ent);
+      else if (ent.isFile()) fileEnts.push(ent);
+    }
+    for (let i = 0; i < fileEnts.length; i += 64) {
+      if (cmp.cancelled) return;
+      await Promise.all(fileEnts.slice(i, i + 64).map(async ent => {
+        const full = path.join(dirPath, ent.name);
+        await sem.acquire();
+        let st;
+        try { st = await fsp.stat(full); }
+        catch { errors++; return; }
+        finally { sem.release(); }
+        files.push({ path: full, name: ent.name, size: st.size, ext: path.extname(ent.name).toLowerCase(), mtime: st.mtimeMs });
+        bytes += st.size;
+      }));
+      const now = Date.now();
+      if (now - lastSent > 100) {
+        lastSent = now;
+        send('compare:progress', { phase: 'scan', side: sideLabel, files: files.length, bytes });
+      }
+    }
+    await Promise.all(dirEnts.map(ent => walk(path.join(dirPath, ent.name))));
+  }
+  await walk(root);
+  send('compare:progress', { phase: 'scan', side: sideLabel, files: files.length, bytes, done: true });
+  return { files, errors, bytes };
+}
+
+async function compareRoots(rootA, rootB) {
+  cmp.running = true;
+  cmp.cancelled = false;
+
+  const [a, b] = await Promise.all([collectFiles(rootA, 'A'), collectFiles(rootB, 'B')]);
+  if (cmp.cancelled) { cmp.running = false; return null; }
+
+  // only sizes present on both sides can possibly match across them
+  const sizesA = new Set(a.files.filter(f => f.size > 0).map(f => f.size));
+  const sizesB = new Set(b.files.filter(f => f.size > 0).map(f => f.size));
+  const candidates = [];
+  for (const f of a.files) if (f.size > 0 && sizesB.has(f.size)) candidates.push({ f, side: 'A' });
+  for (const f of b.files) if (f.size > 0 && sizesA.has(f.size)) candidates.push({ f, side: 'B' });
+
+  const sem = new Semaphore(6);
+  let done = 0, lastSent = 0;
+  const tick = (phase, total) => {
+    done++;
+    const now = Date.now();
+    if (now - lastSent > 100 || done === total) { lastSent = now; send('compare:progress', { phase, done, total }); }
+  };
+
+  send('compare:progress', { phase: 'quick', done: 0, total: candidates.length });
+  await Promise.all(candidates.map(async c => {
+    if (cmp.cancelled) return;
+    await sem.acquire();
+    try { c.qh = await hashRange(c.f.path, 0, Math.min(c.f.size, QUICK_BYTES)); }
+    catch { /* unreadable */ }
+    finally { sem.release(); }
+    tick('quick', candidates.length);
+  }));
+  if (cmp.cancelled) { cmp.running = false; return null; }
+
+  const byQuick = new Map();
+  for (const c of candidates) {
+    if (!c.qh) continue;
+    const k = c.f.size + ':' + c.qh;
+    let arr = byQuick.get(k);
+    if (!arr) byQuick.set(k, arr = []);
+    arr.push(c);
+  }
+
+  const fullList = [...byQuick.values()]
+    .filter(arr => arr.length > 1 && arr.some(c => c.side === 'A') && arr.some(c => c.side === 'B'))
+    .flat()
+    .filter(c => c.f.size > QUICK_BYTES);
+  done = 0; lastSent = 0;
+  send('compare:progress', { phase: 'full', done: 0, total: fullList.length });
+  await Promise.all(fullList.map(async c => {
+    if (cmp.cancelled) return;
+    await sem.acquire();
+    try {
+      c.fh = c.f.size > FULL_HASH_LIMIT ? 'S:' + await sampledHash(c.f.path, c.f.size) : 'F:' + await hashRange(c.f.path, 0, null);
+    } catch { /* unreadable */ }
+    finally { sem.release(); }
+    tick('full', fullList.length);
+  }));
+  if (cmp.cancelled) { cmp.running = false; return null; }
+
+  const finalMap = new Map();
+  for (const arr of byQuick.values()) {
+    if (arr.length < 2) continue;
+    for (const c of arr) {
+      let key;
+      if (c.f.size <= QUICK_BYTES) key = 'Q:' + c.f.size + ':' + c.qh;
+      else { if (!c.fh) continue; key = c.fh + ':' + c.f.size; }
+      let g = finalMap.get(key);
+      if (!g) finalMap.set(key, g = []);
+      g.push(c);
+    }
+  }
+
+  let groups = [];
+  let id = 0, overlapA = 0, overlapB = 0, overlapFilesA = 0, overlapFilesB = 0;
+  for (const [key, arr] of finalMap.entries()) {
+    const countA = arr.filter(c => c.side === 'A').length;
+    const countB = arr.length - countA;
+    if (!countA || !countB) continue; // must exist on both sides
+    const size = arr[0].f.size;
+    overlapA += size * countA;
+    overlapB += size * countB;
+    overlapFilesA += countA;
+    overlapFilesB += countB;
+    groups.push({
+      id: id++, size, countA, countB, count: arr.length,
+      bytes: size * arr.length,
+      verified: !key.startsWith('S:'),
+      ext: arr[0].f.ext,
+      category: categoryOf(arr[0].f.ext),
+      files: arr
+        .map(c => ({ path: c.f.path, name: c.f.name, dir: path.dirname(c.f.path), mtime: c.f.mtime, side: c.side }))
+        .sort((x, y) => x.side.localeCompare(y.side) || y.mtime - x.mtime),
+    });
+  }
+  groups.sort((x, y) => y.bytes - x.bytes);
+  const groupCount = groups.length;
+  groups = groups.slice(0, 400);
+
+  cmp.running = false;
+  return {
+    a: { root: rootA, name: path.basename(rootA) || rootA, files: a.files.length, bytes: a.bytes, errors: a.errors, overlapBytes: overlapA, overlapFiles: overlapFilesA },
+    b: { root: rootB, name: path.basename(rootB) || rootB, files: b.files.length, bytes: b.bytes, errors: b.errors, overlapBytes: overlapB, overlapFiles: overlapFilesB },
+    groups, groupCount, shown: groups.length,
+  };
+}
+
 // ------------------------------------------------------- similar photos
 //
 // dHash (difference hash): decode with Electron's native image codec, shrink
@@ -776,6 +932,19 @@ ipcMain.handle('photos:cancel', () => { state.photoCancelled = true; return true
 
 ipcMain.handle('diff:get', () => computeDiff());
 
+ipcMain.handle('compare:run', async (_e, rootA, rootB) => {
+  if (cmp.running) return { error: 'A comparison is already running.' };
+  try {
+    const res = await compareRoots(rootA, rootB);
+    return res || { cancelled: true };
+  } catch (err) {
+    cmp.running = false;
+    return { error: String(err.message || err) };
+  }
+});
+
+ipcMain.handle('compare:cancel', () => { cmp.cancelled = true; return true; });
+
 ipcMain.handle('index:info', async () => {
   try {
     const meta = JSON.parse(await fsp.readFile(indexPaths().meta, 'utf8'));
@@ -917,6 +1086,6 @@ app.on('window-all-closed', () => {
 
 // Exposed for the headless test harness only.
 module.exports.__test = {
-  state, CFG, runScan, findDuplicates, findSimilarPhotos,
+  state, CFG, runScan, findDuplicates, findSimilarPhotos, compareRoots,
   saveIndex, loadIndex, capturePrevSnapshot, computeDiff, dhashImage, hamming,
 };
