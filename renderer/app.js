@@ -40,6 +40,7 @@ const S = {
   dupeGroupsShown: 80,
   dupeFilters: { sameName: false, minSize: 0, query: '' },
   dupeExpanded: new Set(),
+  dupeStrategy: 'smart',
   largest: { category: null, query: '', rows: [] },
   scanning: false,
 };
@@ -223,6 +224,33 @@ $('#btn-choose').addEventListener('click', async () => {
   $('#quick-row').addEventListener('click', e => {
     const chip = e.target.closest('.quick-chip');
     if (chip) startScan(chip.dataset.path);
+  });
+})();
+
+(async function initResume() {
+  const info = await api.indexInfo();
+  if (!info) return;
+  $('#resume-holder').innerHTML = `
+    <div class="quick-label">previous session</div>
+    <button class="btn btn-ghost" id="btn-resume">⚡ Resume ${esc(info.name || info.root)} — ${esc(fmtBytes(info.totalBytes))} · ${fmtNum(info.fileCount)} files · scanned ${esc(fmtDate(info.savedAt))}</button>`;
+  $('#btn-resume').addEventListener('click', async () => {
+    const btn = $('#btn-resume');
+    btn.disabled = true;
+    btn.textContent = 'Restoring index…';
+    const res = await api.indexLoad();
+    if (res && res.error) {
+      toast(`Couldn't restore: ${res.error}`, false);
+      btn.disabled = false;
+      btn.textContent = 'Resume last session';
+      return;
+    }
+    S.root = res.root;
+    S.storageDir = null;
+    S.overview = await api.overview();
+    enableNav();
+    updateRootCard(res);
+    toast('Previous scan restored instantly — hit Rescan if the folder changed');
+    setView('dashboard');
   });
 })();
 
@@ -663,7 +691,12 @@ function renderDupes() {
       <input class="search-input" id="flt-query" style="margin-left:0;min-width:170px" type="text" placeholder="Filter by name or path…" value="${esc(flt.query)}">
       <div class="dupe-toolbar-spacer"></div>
       <div class="dupe-toolbar-info"><strong>${fmtNum(selCount)}</strong> selected · <strong>${fmtBytes(selBytes)}</strong></div>
-      <button class="btn btn-ghost btn-small" id="btn-auto-select">Auto-select (keep newest)</button>
+      <select class="select" id="sel-strategy" title="Which copy to keep when auto-selecting">
+        <option value="smart" ${S.dupeStrategy === 'smart' ? 'selected' : ''}>Smart (location + name)</option>
+        <option value="newest" ${S.dupeStrategy === 'newest' ? 'selected' : ''}>Keep newest</option>
+        <option value="oldest" ${S.dupeStrategy === 'oldest' ? 'selected' : ''}>Keep oldest</option>
+      </select>
+      <button class="btn btn-ghost btn-small" id="btn-auto-select">Auto-select</button>
       <button class="btn btn-ghost btn-small" id="btn-clear-select" ${selCount ? '' : 'disabled'}>Clear</button>
       <button class="btn btn-danger" id="btn-trash-selected" ${selCount ? '' : 'disabled'}>${ICON_TRASH} Move ${selCount ? fmtNum(selCount) + ' files' : ''} to Trash</button>
     </div>
@@ -680,11 +713,16 @@ function renderDupes() {
     if (q) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
   }, 300));
 
+  $('#sel-strategy').addEventListener('change', e => { S.dupeStrategy = e.target.value; });
   $('#btn-auto-select').addEventListener('click', () => {
     for (const g of groups) {
-      // files are sorted newest-first; keep [0], select the rest
-      g.files.slice(1).forEach(f => S.dupeSelection.add(f.path));
-      S.dupeSelection.delete(g.files[0] && g.files[0].path);
+      let keep = 0; // files are sorted newest-first
+      if (S.dupeStrategy === 'oldest') keep = g.files.length - 1;
+      else if (S.dupeStrategy === 'smart') keep = smartKeepIndex(g);
+      g.files.forEach((f, i) => {
+        if (i === keep) S.dupeSelection.delete(f.path);
+        else S.dupeSelection.add(f.path);
+      });
     }
     renderDupes();
   });
@@ -708,6 +746,37 @@ function renderDupes() {
     const p = e.target.closest('.dupe-file-path');
     if (p) api.reveal(p.dataset.path);
   });
+}
+
+// Score each copy in a group; the highest-scoring copy is the one to KEEP.
+// Prefers organized locations (Pictures, Documents…) and clean names, penalizes
+// Downloads/temp locations and "copy of…" / "(1)" style names. Newest wins ties.
+function smartKeepIndex(g) {
+  const sep = api.platform === 'win32' ? '\\' : '/';
+  const newestMtime = Math.max(...g.files.map(f => f.mtime || 0));
+  const shortestName = Math.min(...g.files.map(f => f.name.length));
+  let best = 0, bestScore = -Infinity;
+  g.files.forEach((f, i) => {
+    let s = 0;
+    const dirParts = f.dir.toLowerCase().split(sep);
+    if (dirParts.includes('downloads')) s -= 20;
+    if (dirParts.includes('desktop')) s -= 8;
+    if (dirParts.some(p => ['tmp', 'temp', 'cache', 'caches', '.trash', 'trash'].includes(p))) s -= 30;
+    if (dirParts.some(p => p.includes('backup') || p === 'old')) s -= 15;
+    if (dirParts.includes('pictures') || dirParts.includes('photos')) s += 15;
+    if (dirParts.includes('documents')) s += 12;
+    if (dirParts.includes('music') || dirParts.includes('movies') || dirParts.includes('videos')) s += 12;
+    const nm = f.name.toLowerCase();
+    if (/( copy| - copy)(\.| \(|$)/.test(nm) || nm.startsWith('copy of ')) s -= 25;
+    if (/\(\d+\)(\.[^.]+)?$/.test(nm) || / \d+(\.[^.]+)?$/.test(nm)) s -= 15;
+    if (/backup|_old\b|\bold[_\- ]/.test(nm)) s -= 15;
+    if (nm.startsWith('~') || nm.startsWith('.')) s -= 10;
+    if (f.name.length === shortestName) s += 6;    // "IMG.jpg" beats "IMG (1).jpg"
+    if ((f.mtime || 0) === newestMtime) s += 3;    // newest as tie-break
+    s += Math.max(0, 6 - dirParts.length) * 0.5;   // slightly prefer shallower, organized paths
+    if (s > bestScore) { bestScore = s; best = i; }
+  });
+  return best;
 }
 
 function filteredDupeGroups() {

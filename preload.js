@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('nebula', {
   pickFolder: () => ipcRenderer.invoke('app:pickFolder'),
   quickFolders: () => ipcRenderer.invoke('app:quickFolders'),
   scan: (root) => ipcRenderer.invoke('scan:start', root),
+  indexInfo: () => ipcRenderer.invoke('index:info'),
+  indexLoad: () => ipcRenderer.invoke('index:load'),
   cancelScan: () => ipcRenderer.invoke('scan:cancel'),
   overview: () => ipcRenderer.invoke('data:overview'),
   dirNode: (p) => ipcRenderer.invoke('dir:node', p),

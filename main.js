@@ -5,6 +5,10 @@ const fsp = fs.promises;
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
 
 const DEBUG = !!process.env.NEBULA_DEBUG;
 
@@ -155,12 +159,7 @@ async function runScan(root) {
   }
 
   await walk(root, rootNode);
-
-  (function sortNode(n) {
-    n.children.sort((a, b) => b.size - a.size);
-    for (const c of n.children) if (c.isDir) sortNode(c);
-  })(rootNode);
-
+  sortTree(rootNode);
   state.scanning = false;
   return {
     root,
@@ -171,6 +170,98 @@ async function runScan(root) {
     errors: progress.errors,
     elapsedMs: Date.now() - started,
     cancelled: state.scanCancelled,
+  };
+}
+
+function sortTree(n) {
+  n.children.sort((a, b) => b.size - a.size);
+  for (const c of n.children) if (c.isDir) sortTree(c);
+}
+
+// ------------------------------------------------------- persistent index
+
+const INDEX_VERSION = 1;
+
+function indexPaths() {
+  const dir = app.getPath('userData');
+  return { data: path.join(dir, 'index-v1.gz'), meta: path.join(dir, 'index-meta.json') };
+}
+
+async function saveIndex() {
+  if (!state.rootNode || state.scanning) return;
+  const { data, meta } = indexPaths();
+  const payload = {
+    v: INDEX_VERSION,
+    root: state.root,
+    savedAt: Date.now(),
+    files: state.files.map(f => [f.path, f.size, Math.round(f.mtime)]),
+  };
+  await fsp.writeFile(data, await gzip(JSON.stringify(payload)));
+  await fsp.writeFile(meta, JSON.stringify({
+    v: INDEX_VERSION,
+    root: state.root,
+    name: state.rootNode.name,
+    savedAt: payload.savedAt,
+    fileCount: state.files.length,
+    totalBytes: state.rootNode.size,
+  }));
+}
+
+let saveTimer = null;
+function scheduleSaveIndex() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveIndex().catch(() => {}), 1500);
+}
+
+async function loadIndex() {
+  const { data } = indexPaths();
+  const payload = JSON.parse((await gunzip(await fsp.readFile(data))).toString());
+  if (payload.v !== INDEX_VERSION) throw new Error('saved index is from an incompatible version');
+  const root = payload.root;
+
+  state.root = root;
+  state.files = [];
+  state.dirIndex = new Map();
+  state.duplicates = null;
+  const rootNode = { name: path.basename(root) || root, path: root, size: 0, isDir: true, fileCount: 0, children: [] };
+  state.rootNode = rootNode;
+  state.dirIndex.set(root, rootNode);
+
+  const ensureDir = dirPath => {
+    let node = state.dirIndex.get(dirPath);
+    if (node) return node;
+    const parent = ensureDir(path.dirname(dirPath));
+    node = { name: path.basename(dirPath), path: dirPath, size: 0, isDir: true, fileCount: 0, children: [] };
+    parent.children.push(node);
+    state.dirIndex.set(dirPath, node);
+    return node;
+  };
+
+  for (const [p, size, mtime] of payload.files) {
+    if (p !== root && !p.startsWith(root)) continue;
+    const name = path.basename(p);
+    const ext = path.extname(name).toLowerCase();
+    state.files.push({ path: p, name, size, ext, mtime });
+    ensureDir(path.dirname(p)).children.push({ name, path: p, size, isDir: false, ext, mtime });
+    let d = path.dirname(p);
+    while (true) {
+      const n = state.dirIndex.get(d);
+      if (n) { n.size += size; n.fileCount += 1; }
+      if (d === root) break;
+      const up = path.dirname(d);
+      if (up === d) break;
+      d = up;
+    }
+  }
+  sortTree(rootNode);
+  return {
+    root,
+    name: rootNode.name,
+    totalBytes: rootNode.size,
+    fileCount: state.files.length,
+    dirCount: state.dirIndex.size - 1,
+    savedAt: payload.savedAt,
+    restored: true,
   };
 }
 
@@ -446,11 +537,25 @@ ipcMain.handle('app:quickFolders', () => {
 ipcMain.handle('scan:start', async (_e, root) => {
   if (state.scanning) return { error: 'A scan is already running.' };
   try {
-    return await runScan(root);
+    const res = await runScan(root);
+    if (!res.cancelled) saveIndex().catch(() => {});
+    return res;
   } catch (err) {
     state.scanning = false;
     return { error: String(err.message || err) };
   }
+});
+
+ipcMain.handle('index:info', async () => {
+  try {
+    const meta = JSON.parse(await fsp.readFile(indexPaths().meta, 'utf8'));
+    return meta.v === INDEX_VERSION ? meta : null;
+  } catch { return null; }
+});
+
+ipcMain.handle('index:load', async () => {
+  try { return await loadIndex(); }
+  catch (err) { return { error: String(err.message || err) }; }
 });
 
 ipcMain.handle('scan:cancel', () => { state.scanCancelled = true; return true; });
@@ -524,6 +629,7 @@ ipcMain.handle('files:trash', async (_e, paths) => {
       state.duplicates.shown = state.duplicates.groups.length;
       state.duplicates.totalWasted = state.duplicates.groups.reduce((s, g) => s + g.wasted, 0);
     }
+    scheduleSaveIndex();
   }
   return { trashed, failed };
 });

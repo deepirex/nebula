@@ -13,8 +13,12 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
 - **Duplicates** — three-pass detection: group by exact size → fingerprint the
   first 128 KB → confirm with a full streaming SHA-1 of the content (files over
   1.5 GB use a head/middle/tail sampled hash and are labeled "sampled match").
-  Auto-select keeps the newest copy; removal goes to the Trash/Recycle Bin, never
-  a permanent delete.
+  Auto-select strategies: **Smart** (prefers organized locations and clean names,
+  penalizes Downloads/temp folders and "copy of…"/"(1)" names), keep newest, or
+  keep oldest. Removal goes to the Trash/Recycle Bin, never a permanent delete.
+- **Instant reopen** — every completed scan is saved to a compressed index, so
+  the next launch offers "Resume last session" and restores the full dashboard
+  in moments without rescanning.
 - **Largest Files** — top 150 by size with type filters, search, reveal, and
   trash actions.
 - Works across all file types and sizes; symlinks are never followed (no cycles,
