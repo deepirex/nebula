@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>Nebula — Storage Intelligence</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="aurora" aria-hidden="true">
+    <div class="aurora-blob aurora-a"></div>
+    <div class="aurora-blob aurora-b"></div>
+    <div class="aurora-grid"></div>
+  </div>
+
+  <div id="titlebar"></div>
+
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="brand-orb"><div class="brand-orb-core"></div></div>
+        <div class="brand-text">
+          <span class="brand-name">Nebula</span>
+          <span class="brand-sub">Storage Intelligence</span>
+        </div>
+      </div>
+
+      <nav id="nav">
+        <button class="nav-item" data-view="dashboard" disabled>
+          <svg viewBox="0 0 24 24"><path d="M4 13h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1Zm0 8h6a1 1 0 0 0 1-1v-4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v4a1 1 0 0 0 1 1Zm10 0h6a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1Zm-1-17v4a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1Z"/></svg>
+          <span>Dashboard</span>
+        </button>
+        <button class="nav-item" data-view="storage" disabled>
+          <svg viewBox="0 0 24 24"><path d="M3 5a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a1 1 0 0 0 .8.4H19a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Z"/></svg>
+          <span>Storage Map</span>
+        </button>
+        <button class="nav-item" data-view="dupes" disabled>
+          <svg viewBox="0 0 24 24"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2Zm2 0h5a2 2 0 0 1 2 2v5h2V5h-9v2Z"/></svg>
+          <span>Duplicates</span>
+          <span class="nav-badge" id="dupe-badge" hidden></span>
+        </button>
+        <button class="nav-item" data-view="largest" disabled>
+          <svg viewBox="0 0 24 24"><path d="M4 20a1 1 0 0 1-1-1v-5h4v6H4Zm6 0v-10h4v10h-4Zm6 0V4h4v15a1 1 0 0 1-1 1h-3Z"/></svg>
+          <span>Largest Files</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+
+      <div id="root-card" class="root-card" hidden>
+        <div class="root-card-label">Analyzing</div>
+        <div class="root-card-name" id="root-card-name"></div>
+        <div class="root-card-meta" id="root-card-meta"></div>
+        <button class="btn btn-ghost btn-small" id="btn-rescan">
+          <svg viewBox="0 0 24 24" class="icon-14"><path d="M12 4V1L7 6l5 5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-9Z"/></svg>
+          Rescan
+        </button>
+        <button class="btn btn-ghost btn-small" id="btn-newscan">
+          <svg viewBox="0 0 24 24" class="icon-14"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" fill="none"/></svg>
+          New folder
+        </button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <!-- Welcome -->
+      <section id="view-welcome" class="view">
+        <div class="welcome">
+          <div class="welcome-orb">
+            <div class="orb-ring orb-ring-1"></div>
+            <div class="orb-ring orb-ring-2"></div>
+            <div class="orb-core"></div>
+          </div>
+          <h1 class="welcome-title">See where your storage goes</h1>
+          <p class="welcome-sub">Scan any folder or drive to map disk usage, surface your largest files, and find duplicates you can safely reclaim.</p>
+          <button class="btn btn-primary btn-large" id="btn-choose">
+            <svg viewBox="0 0 24 24" class="icon-16"><path d="M3 5a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a1 1 0 0 0 .8.4H19a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Z"/></svg>
+            Choose a folder…
+          </button>
+          <div class="quick-label">or start with</div>
+          <div class="quick-row" id="quick-row"></div>
+        </div>
+      </section>
+
+      <!-- Scanning -->
+      <section id="view-scanning" class="view" hidden>
+        <div class="scanning">
+          <div class="scan-orbit">
+            <div class="scan-ring"></div>
+            <div class="scan-ring scan-ring-rev"></div>
+            <div class="scan-core"></div>
+          </div>
+          <h2 class="scan-title">Scanning <span id="scan-target"></span></h2>
+          <div class="scan-stats">
+            <div class="scan-stat"><span class="scan-stat-value" id="scan-bytes">0 B</span><span class="scan-stat-label">discovered</span></div>
+            <div class="scan-stat"><span class="scan-stat-value" id="scan-files">0</span><span class="scan-stat-label">files</span></div>
+            <div class="scan-stat"><span class="scan-stat-value" id="scan-dirs">0</span><span class="scan-stat-label">folders</span></div>
+          </div>
+          <div class="scan-current" id="scan-current">&nbsp;</div>
+          <button class="btn btn-ghost" id="btn-cancel-scan">Cancel</button>
+        </div>
+      </section>
+
+      <!-- Dashboard -->
+      <section id="view-dashboard" class="view" hidden></section>
+
+      <!-- Storage map -->
+      <section id="view-storage" class="view" hidden></section>
+
+      <!-- Duplicates -->
+      <section id="view-dupes" class="view" hidden></section>
+
+      <!-- Largest files -->
+      <section id="view-largest" class="view" hidden></section>
+    </main>
+  </div>
+
+  <div id="tooltip" hidden></div>
+  <div id="modal-root" hidden></div>
+  <div id="toast-root"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

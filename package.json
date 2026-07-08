@@ -1,0 +1,32 @@
+{
+  "name": "nebula-storage",
+  "productName": "Nebula",
+  "version": "1.0.0",
+  "description": "Storage intelligence — disk usage maps, duplicate detection, and large-file cleanup for macOS and Windows",
+  "main": "main.js",
+  "author": "Nebula",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "npx electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  },
+  "build": {
+    "appId": "com.nebula.storage",
+    "productName": "Nebula",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**"
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}
