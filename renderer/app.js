@@ -45,6 +45,7 @@ const S = {
   similar: null,
   photoSelection: new Set(),
   cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80, scope: 'cross' },
+  org: { folder: null, byYear: false, plan: null, excluded: new Set(), lastResult: null },
   scanning: false,
 };
 
@@ -151,6 +152,7 @@ function setView(name) {
   if (name === 'photos') renderPhotos();
   if (name === 'changes') renderChanges();
   if (name === 'compare') renderCompare();
+  if (name === 'organize') renderOrganize();
 }
 
 $$('.nav-item').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
@@ -1517,6 +1519,196 @@ async function trashSelectedCompare() {
   if (res.failed.length) toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} failed (network drives may lack a Trash)`, false);
   else toast(`Moved ${fmtNum(res.trashed.length)} files to Trash`);
   renderCompare();
+}
+
+// ------------------------------------------------------------- organize
+
+async function quietRescan() {
+  if (!S.root || S.scanning) return;
+  S.scanning = true;
+  const res = await api.scan(S.root);
+  S.scanning = false;
+  if (res && !res.error) {
+    S.overview = await api.overview();
+    updateRootCard(res);
+    S.storageDir = null;
+  }
+}
+
+function renderOrganize() {
+  const el = $('#view-organize');
+  const O = S.org;
+  if (!O.folder && S.root) O.folder = S.root;
+
+  // ---------- result state (after apply)
+  if (O.lastResult) {
+    const r = O.lastResult;
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Organize</div>
+        <div class="view-sub">${esc(O.folder)}</div>
+      </div></div>
+      <div class="panel dupe-idle">
+        <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg></div>
+        <h3>Moved ${fmtNum(r.moved)} files into ${fmtNum(r.folders)} folders</h3>
+        <p>${r.failed.length ? `${fmtNum(r.failed.length)} files couldn't be moved (${esc(r.failed[0].error)}).` : 'Everything landed where the preview said it would.'} Changed your mind? One click puts every file back exactly where it was.</p>
+        <div style="display:flex;gap:10px;justify-content:center">
+          <button class="btn btn-ghost" id="btn-org-undo">↩ Undo — put everything back</button>
+          <button class="btn btn-primary" id="btn-org-again">Organize another folder</button>
+        </div>
+      </div>`;
+    $('#btn-org-undo').addEventListener('click', async () => {
+      const res = await api.orgUndo();
+      if (res.error) { toast(res.error, false); return; }
+      toast(`Restored ${fmtNum(res.restored)} files to their original locations`);
+      O.lastResult = null;
+      O.plan = null;
+      quietRescan();
+      renderOrganize();
+    });
+    $('#btn-org-again').addEventListener('click', () => { O.lastResult = null; O.plan = null; renderOrganize(); });
+    return;
+  }
+
+  // ---------- setup state
+  if (!O.plan) {
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Organize</div>
+        <div class="view-sub">Tidy a messy folder automatically — with a full preview and per-file control before anything moves</div>
+      </div></div>
+      <div class="cmp-setup" style="grid-template-columns:1fr;max-width:620px">
+        <div class="cmp-pick ${O.folder ? 'filled' : ''}" id="org-pick">
+          <span class="side-tag" style="color:#6ea6ec">FOLDER TO TIDY</span>
+          ${O.folder ? `<div class="cmp-path">${esc(O.folder)}</div><div class="cmp-hint">click to change</div>`
+                     : `<div class="cmp-path">Choose folder…</div><div class="cmp-hint">e.g. Downloads or Desktop</div>`}
+        </div>
+      </div>
+      <div style="text-align:center">
+        <label class="dupe-filter" style="justify-content:center;margin-bottom:16px">
+          <input type="checkbox" id="org-byyear" ${O.byYear ? 'checked' : ''}> Group photos, images & documents by year
+        </label>
+        <div>
+          <button class="btn btn-primary btn-large" id="btn-org-preview" ${O.folder ? '' : 'disabled'}>Preview organization</button>
+        </div>
+        <div class="quick-label" style="margin-top:14px">only loose files at the top level are organized — subfolders and their contents are never touched · nothing moves until you approve the preview</div>
+      </div>`;
+    $('#org-pick').addEventListener('click', async () => { const p = await api.pickFolder(); if (p) { O.folder = p; renderOrganize(); } });
+    $('#org-byyear').addEventListener('change', e => { O.byYear = e.target.checked; });
+    $('#btn-org-preview').addEventListener('click', async () => {
+      const plan = await api.orgPlan(O.folder, { byYear: O.byYear });
+      if (plan.error) { toast(plan.error, false); return; }
+      O.plan = plan;
+      O.excluded = new Set();
+      renderOrganize();
+    });
+    return;
+  }
+
+  // ---------- preview state (before / after with per-file control)
+  const plan = O.plan;
+  const included = plan.moves.filter(m => !O.excluded.has(m.from));
+  const byDest = new Map();
+  plan.moves.forEach((m, i) => {
+    let g = byDest.get(m.destDir);
+    if (!g) byDest.set(m.destDir, g = []);
+    g.push({ ...m, i });
+  });
+  const destDirs = [...byDest.keys()];
+  const includedBytes = included.reduce((s, m) => s + m.size, 0);
+
+  if (!plan.moves.length) {
+    el.innerHTML = `
+      <div class="view-head"><div>
+        <div class="view-title">Organize</div>
+        <div class="view-sub">${esc(plan.folder)}</div>
+      </div></div>
+      <div class="panel dupe-idle">
+        <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg></div>
+        <h3>Nothing to organize</h3>
+        <p>${plan.staying ? `The ${fmtNum(plan.staying)} loose files here don't match any organization rule.` : 'There are no loose files at the top level of this folder.'}</p>
+        <button class="btn btn-ghost" id="btn-org-back">Choose a different folder</button>
+      </div>`;
+    $('#btn-org-back').addEventListener('click', () => { O.plan = null; renderOrganize(); });
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="view-head">
+      <div>
+        <div class="view-title">Organize — preview</div>
+        <div class="view-sub"><strong>Before:</strong> ${fmtNum(plan.moves.length + plan.staying)} loose files in ${esc(plan.folder)} · <strong>After:</strong> ${fmtNum(destDirs.length)} tidy folders${plan.staying ? ` + ${fmtNum(plan.staying)} files left as-is` : ''}</div>
+      </div>
+      <button class="btn btn-ghost btn-small" id="btn-org-back">← Back</button>
+    </div>
+
+    <div class="dupe-toolbar">
+      <div class="dupe-toolbar-info"><strong>${fmtNum(included.length)}</strong> of ${fmtNum(plan.moves.length)} files will move · <strong>${fmtBytes(includedBytes)}</strong> — uncheck anything you want to keep in place</div>
+      <div class="dupe-toolbar-spacer"></div>
+      <button class="btn btn-primary" id="btn-org-apply" ${included.length ? '' : 'disabled'}>Move ${fmtNum(included.length)} files</button>
+    </div>
+
+    <div id="org-groups">
+      ${destDirs.map(dest => {
+        const rows = byDest.get(dest);
+        const inc = rows.filter(m => !O.excluded.has(m.from));
+        return `
+        <div class="panel dupe-group">
+          <div class="dupe-group-head">
+            <div class="file-chip" style="background:#2a78d6">${ICON_FOLDER}</div>
+            <div class="dupe-group-title">→ ${esc(dest)}/</div>
+            <div class="dupe-group-meta">${fmtNum(inc.length)} of ${fmtNum(rows.length)} files · ${fmtBytes(inc.reduce((s, m) => s + m.size, 0))}</div>
+            <button class="btn btn-ghost btn-small" data-toggle-dest="${esc(dest)}">${inc.length === rows.length ? 'Exclude all' : 'Include all'}</button>
+          </div>
+          ${rows.map(m => `
+            <div class="dupe-file">
+              <input type="checkbox" data-from="${esc(m.from)}" ${O.excluded.has(m.from) ? '' : 'checked'}>
+              <div class="dupe-file-name">${esc(m.name)}</div>
+              <span class="type-pill">${esc(m.reason)}</span>
+              <div class="dupe-file-path" style="cursor:default">${fmtBytes(m.size)}</div>
+              <div class="dupe-file-date">${fmtDate(m.mtime)}</div>
+            </div>`).join('')}
+        </div>`;
+      }).join('')}
+    </div>`;
+
+  $('#btn-org-back').addEventListener('click', () => { O.plan = null; renderOrganize(); });
+  $('#btn-org-apply').addEventListener('click', applyOrganizePlan);
+  el.querySelectorAll('[data-toggle-dest]').forEach(btn => btn.addEventListener('click', () => {
+    const dest = btn.dataset.toggleDest;
+    const rows = byDest.get(dest);
+    const allIncluded = rows.every(m => !O.excluded.has(m.from));
+    rows.forEach(m => { if (allIncluded) O.excluded.add(m.from); else O.excluded.delete(m.from); });
+    renderOrganize();
+  }));
+  $('#org-groups').addEventListener('change', e => {
+    const cb = e.target.closest('input[type="checkbox"]');
+    if (!cb) return;
+    if (cb.checked) O.excluded.delete(cb.dataset.from);
+    else O.excluded.add(cb.dataset.from);
+    renderOrganize();
+  });
+}
+
+async function applyOrganizePlan() {
+  const O = S.org;
+  const included = O.plan.moves.filter(m => !O.excluded.has(m.from));
+  if (!included.length) return;
+  const folders = new Set(included.map(m => m.destDir)).size;
+  const ok = await confirmModal({
+    title: 'Organize files?',
+    body: `<strong>${fmtNum(included.length)} files</strong> will be moved into <strong>${fmtNum(folders)} folders</strong> inside ${esc(O.plan.folder)}. Nothing is deleted or overwritten, and you can undo the whole operation afterwards.`,
+    confirmLabel: `Move ${fmtNum(included.length)} files`,
+  });
+  if (!ok) return;
+
+  const res = await api.orgApply(O.plan.folder, included.map(m => ({ from: m.from, destDir: m.destDir })));
+  if (res.error) { toast(res.error, false); return; }
+  O.lastResult = { moved: res.moved, failed: res.failed, folders };
+  if (res.failed.length) toast(`Moved ${fmtNum(res.moved)} files — ${fmtNum(res.failed.length)} failed`, false);
+  else toast(`Organized ${fmtNum(res.moved)} files into ${fmtNum(folders)} folders`);
+  quietRescan();
+  renderOrganize();
 }
 
 // ------------------------------------------------------------- largest files

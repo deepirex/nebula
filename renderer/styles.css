@@ -318,6 +318,7 @@ body {
 .file-row-name { font-size: 12.5px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-row-path { font-size: 10.5px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 .file-row-size { font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.file-chip svg { width: 15px; height: 15px; fill: #fff; }
 
 /* ============================================================ storage map */
 .crumbs { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; font-size: 12.5px; margin-bottom: 14px; }

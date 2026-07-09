@@ -90,7 +90,39 @@ app.whenReady().then(async () => {
       cross.verified === true;
     console.log(okCmp ? 'COMPARE OK' : 'COMPARE FAIL');
 
-    app.exit(okSim && okDiff && okCmp ? 0 : 1);
+    // --- organize: plan → apply → undo round-trip
+    const org = path.join(work, 'orgdir');
+    fs.rmSync(org, { recursive: true, force: true });
+    fs.mkdirSync(path.join(org, 'existing sub'), { recursive: true });
+    fs.writeFileSync(path.join(org, 'Screenshot 2026-07-01 at 09.15.02.png'), Buffer.alloc(2000, 3));
+    fs.writeFileSync(path.join(org, 'IMG_4412.jpg'), Buffer.alloc(3000, 4));
+    fs.writeFileSync(path.join(org, 'setup-things.dmg'), Buffer.alloc(4000, 5));
+    fs.writeFileSync(path.join(org, 'taxes 2025.pdf'), Buffer.alloc(1500, 6));
+    fs.writeFileSync(path.join(org, 'song.mp3'), Buffer.alloc(2500, 7));
+    fs.writeFileSync(path.join(org, 'mystery.xyz'), Buffer.alloc(500, 8));           // no rule → stays
+    fs.writeFileSync(path.join(org, 'existing sub', 'inside.pdf'), Buffer.alloc(100)); // in subfolder → untouched
+    const plan = await t.buildOrganizePlan(org, { byYear: false });
+    console.log('ORG plan:', plan.moves.map(m => `${m.name} -> ${m.destDir}`).join(' | '), 'staying=', plan.staying);
+    const dest = n => (plan.moves.find(m => m.name === n) || {}).destDir;
+    const okPlan = dest('Screenshot 2026-07-01 at 09.15.02.png') === 'Screenshots' &&
+      dest('IMG_4412.jpg') === 'Photos' && dest('setup-things.dmg') === 'Installers' &&
+      dest('taxes 2025.pdf') === 'Documents' && dest('song.mp3') === 'Music' &&
+      plan.staying === 1 && plan.moves.length === 5;
+    const applied = await t.applyOrganize(org, plan.moves);
+    const okApply = applied.moved.length === 5 && applied.failed.length === 0 &&
+      fs.existsSync(path.join(org, 'Screenshots', 'Screenshot 2026-07-01 at 09.15.02.png')) &&
+      fs.existsSync(path.join(org, 'Documents', 'taxes 2025.pdf')) &&
+      fs.existsSync(path.join(org, 'mystery.xyz')) &&
+      fs.existsSync(path.join(org, 'existing sub', 'inside.pdf'));
+    const undone = await t.undoOrganize();
+    const okUndo = undone.restored === 5 &&
+      fs.existsSync(path.join(org, 'IMG_4412.jpg')) &&
+      fs.existsSync(path.join(org, 'song.mp3')) &&
+      !fs.existsSync(path.join(org, 'Screenshots'));
+    console.log('ORG apply=%s undo=%s', okApply, okUndo);
+    console.log(okPlan && okApply && okUndo ? 'ORGANIZE OK' : 'ORGANIZE FAIL');
+
+    app.exit(okSim && okDiff && okCmp && okPlan && okApply && okUndo ? 0 : 1);
   } catch (e) {
     console.error('FAIL', e);
     app.exit(1);

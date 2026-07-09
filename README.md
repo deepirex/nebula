@@ -27,7 +27,13 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
   grown files, and what was deleted.
 - **Compare** — content-match any two folders or drives (internal, external,
   or network): what's duplicated across both sides regardless of filename,
-  what's unique to each, with per-side bulk selection to clear one copy.
+  what's unique to each — plus duplicates *within* each side — with per-side
+  bulk selection to clear one copy.
+- **Organize** — auto-tidy a messy folder (Downloads, Desktop…): screenshots,
+  camera photos, installers, archives, documents and more are sorted into
+  dedicated subfolders, optionally grouped by year. Full before/after preview
+  with a checkbox on every file, nothing is overwritten, only top-level loose
+  files are touched, and the whole operation is one-click undoable.
 - **Largest Files** — top 150 by size with type filters, search, reveal, and
   trash actions.
 - Works across all file types and sizes; symlinks are never followed (no cycles,

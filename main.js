@@ -475,6 +475,112 @@ async function findDuplicates() {
   return state.duplicates;
 }
 
+// ------------------------------------------------------- auto-organize
+//
+// Builds a *plan* (never executes directly): loose files at the TOP LEVEL of
+// a folder are classified into destination subfolders by name patterns and
+// type. The renderer shows the plan for per-file approval; apply is a batch
+// of same-volume renames with collision-safe names; undo restores everything.
+
+const INSTALLER_EXTS = new Set(['.dmg', '.pkg', '.msi', '.exe', '.deb', '.rpm', '.xip', '.appimage']);
+const FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
+
+function classifyForOrganize(name, ext, mtime, byYear) {
+  const year = new Date(mtime).getFullYear();
+  const y = d => (byYear ? path.join(d, String(year)) : d);
+  if (/^(screen\s?shot|screenshot|screencap|screen\s?recording)/i.test(name)) {
+    return { dest: y('Screenshots'), reason: 'Screenshot' };
+  }
+  if (/^(img|dsc|dscn|pxl|gopr|dji)[_\- ]?\d/i.test(name) && categoryOf(ext) === 'Images') {
+    return { dest: y('Photos'), reason: 'Camera photo' };
+  }
+  if (INSTALLER_EXTS.has(ext)) return { dest: 'Installers', reason: 'Installer' };
+  if (FONT_EXTS.has(ext)) return { dest: 'Fonts', reason: 'Font' };
+  switch (categoryOf(ext)) {
+    case 'Archives': return { dest: 'Archives', reason: 'Archive' };
+    case 'Images': return { dest: y('Images'), reason: 'Image' };
+    case 'Video': return { dest: y('Videos'), reason: 'Video' };
+    case 'Audio': return { dest: y('Music'), reason: 'Audio' };
+    case 'Documents': return { dest: y('Documents'), reason: 'Document' };
+    case 'Code & Data': return { dest: 'Code & Data', reason: 'Data file' };
+    default: return null; // unknown or system files stay put
+  }
+}
+
+async function buildOrganizePlan(folder, opts = {}) {
+  const byYear = !!opts.byYear;
+  const entries = await fsp.readdir(folder, { withFileTypes: true });
+  const moves = [];
+  let staying = 0;
+  for (const ent of entries) {
+    if (ent.isSymbolicLink() || !ent.isFile()) continue;
+    if (ent.name.startsWith('.') || ent.name.toLowerCase() === 'desktop.ini') continue;
+    const full = path.join(folder, ent.name);
+    let st;
+    try { st = await fsp.stat(full); } catch { continue; }
+    const ext = path.extname(ent.name).toLowerCase();
+    const c = classifyForOrganize(ent.name, ext, st.mtimeMs, byYear);
+    if (!c) { staying++; continue; }
+    moves.push({ from: full, name: ent.name, size: st.size, mtime: st.mtimeMs, destDir: c.dest, reason: c.reason });
+  }
+  moves.sort((a, b) => a.destDir.localeCompare(b.destDir) || a.name.localeCompare(b.name));
+  return { folder, moves, staying };
+}
+
+let lastOrganize = null;
+
+function uniqueDest(destPath) {
+  if (!fs.existsSync(destPath)) return destPath;
+  const dir = path.dirname(destPath);
+  const ext = path.extname(destPath);
+  const base = path.basename(destPath, ext);
+  for (let i = 2; i < 1000; i++) {
+    const p = path.join(dir, `${base} (${i})${ext}`);
+    if (!fs.existsSync(p)) return p;
+  }
+  throw new Error('too many name collisions');
+}
+
+async function applyOrganize(folder, moves) {
+  const moved = [];
+  const failed = [];
+  for (const m of moves) {
+    try {
+      const destDirAbs = path.join(folder, m.destDir);
+      await fsp.mkdir(destDirAbs, { recursive: true });
+      const to = uniqueDest(path.join(destDirAbs, path.basename(m.from)));
+      await fsp.rename(m.from, to);
+      moved.push({ from: m.from, to });
+    } catch (err) {
+      failed.push({ from: m.from, error: String(err.message || err) });
+    }
+  }
+  if (moved.length) lastOrganize = { folder, moved, at: Date.now() };
+  return { moved, failed };
+}
+
+async function undoOrganize() {
+  if (!lastOrganize) return { error: 'Nothing to undo.' };
+  const restored = [];
+  const failed = [];
+  const dirs = new Set();
+  for (const m of lastOrganize.moved) {
+    try {
+      const back = uniqueDest(m.from);
+      await fsp.rename(m.to, back);
+      restored.push(back);
+      dirs.add(path.dirname(m.to));
+    } catch (err) {
+      failed.push({ path: m.to, error: String(err.message || err) });
+    }
+  }
+  for (const d of [...dirs].sort((a, b) => b.length - a.length)) {
+    try { await fsp.rmdir(d); } catch { /* not empty — keep */ }
+  }
+  lastOrganize = null;
+  return { restored: restored.length, failed };
+}
+
 // ------------------------------------------------------- compare two roots
 //
 // Scans two folders (any drives) in parallel, then content-matches files
@@ -966,6 +1072,23 @@ ipcMain.handle('compare:run', async (_e, rootA, rootB) => {
 
 ipcMain.handle('compare:cancel', () => { cmp.cancelled = true; return true; });
 
+ipcMain.handle('org:plan', async (_e, folder, opts) => {
+  try { return await buildOrganizePlan(folder, opts); }
+  catch (err) { return { error: String(err.message || err) }; }
+});
+
+ipcMain.handle('org:apply', async (_e, folder, moves) => {
+  try {
+    const res = await applyOrganize(folder, moves);
+    return { moved: res.moved.length, failed: res.failed };
+  } catch (err) { return { error: String(err.message || err) }; }
+});
+
+ipcMain.handle('org:undo', async () => {
+  try { return await undoOrganize(); }
+  catch (err) { return { error: String(err.message || err) }; }
+});
+
 ipcMain.handle('index:info', async () => {
   try {
     const meta = JSON.parse(await fsp.readFile(indexPaths().meta, 'utf8'));
@@ -1109,4 +1232,5 @@ app.on('window-all-closed', () => {
 module.exports.__test = {
   state, CFG, runScan, findDuplicates, findSimilarPhotos, compareRoots,
   saveIndex, loadIndex, capturePrevSnapshot, computeDiff, dhashImage, hamming,
+  buildOrganizePlan, applyOrganize, undoOrganize,
 };
