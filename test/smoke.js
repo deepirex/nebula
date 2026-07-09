@@ -119,10 +119,18 @@ app.whenReady().then(async () => {
       fs.existsSync(path.join(org, 'IMG_4412.jpg')) &&
       fs.existsSync(path.join(org, 'song.mp3')) &&
       !fs.existsSync(path.join(org, 'Screenshots'));
-    console.log('ORG apply=%s undo=%s', okApply, okUndo);
-    console.log(okPlan && okApply && okUndo ? 'ORGANIZE OK' : 'ORGANIZE FAIL');
+    // batch-by-batch apply must accumulate into ONE undo record
+    const plan2 = await t.buildOrganizePlan(org, { byYear: false });
+    const shots = plan2.moves.filter(m => m.destDir === 'Screenshots');
+    const rest = plan2.moves.filter(m => m.destDir !== 'Screenshots');
+    await t.applyOrganize(org, shots);
+    await t.applyOrganize(org, rest);
+    const undone2 = await t.undoOrganize();
+    const okBatch = undone2.restored === 5 && fs.existsSync(path.join(org, 'IMG_4412.jpg')) && !fs.existsSync(path.join(org, 'Music'));
+    console.log('ORG apply=%s undo=%s batchUndo=%s', okApply, okUndo, okBatch);
+    console.log(okPlan && okApply && okUndo && okBatch ? 'ORGANIZE OK' : 'ORGANIZE FAIL');
 
-    app.exit(okSim && okDiff && okCmp && okPlan && okApply && okUndo ? 0 : 1);
+    app.exit(okSim && okDiff && okCmp && okPlan && okApply && okUndo && okBatch ? 0 : 1);
   } catch (e) {
     console.error('FAIL', e);
     app.exit(1);

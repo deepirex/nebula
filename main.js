@@ -555,7 +555,12 @@ async function applyOrganize(folder, moves) {
       failed.push({ from: m.from, error: String(err.message || err) });
     }
   }
-  if (moved.length) lastOrganize = { folder, moved, at: Date.now() };
+  if (moved.length) {
+    // accumulate within the same folder so undo restores the whole session,
+    // even when the user applies destination-by-destination
+    if (lastOrganize && lastOrganize.folder === folder) lastOrganize.moved.push(...moved);
+    else lastOrganize = { folder, moved, at: Date.now() };
+  }
   return { moved, failed };
 }
 

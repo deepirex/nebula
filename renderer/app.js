@@ -45,7 +45,7 @@ const S = {
   similar: null,
   photoSelection: new Set(),
   cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80, scope: 'cross' },
-  org: { folder: null, byYear: false, plan: null, excluded: new Set(), lastResult: null },
+  org: { folder: null, byYear: false, plan: null, excluded: new Set(), lastResult: null, sessionMoved: 0, sessionFolders: new Set() },
   scanning: false,
 };
 
@@ -1563,10 +1563,12 @@ function renderOrganize() {
       toast(`Restored ${fmtNum(res.restored)} files to their original locations`);
       O.lastResult = null;
       O.plan = null;
+      O.sessionMoved = 0;
+      O.sessionFolders = new Set();
       quietRescan();
       renderOrganize();
     });
-    $('#btn-org-again').addEventListener('click', () => { O.lastResult = null; O.plan = null; renderOrganize(); });
+    $('#btn-org-again').addEventListener('click', () => { O.lastResult = null; O.plan = null; O.sessionMoved = 0; O.sessionFolders = new Set(); renderOrganize(); });
     return;
   }
 
@@ -1600,6 +1602,8 @@ function renderOrganize() {
       if (plan.error) { toast(plan.error, false); return; }
       O.plan = plan;
       O.excluded = new Set();
+      O.sessionMoved = 0;
+      O.sessionFolders = new Set();
       renderOrganize();
     });
     return;
@@ -1645,7 +1649,8 @@ function renderOrganize() {
     <div class="dupe-toolbar">
       <div class="dupe-toolbar-info"><strong>${fmtNum(included.length)}</strong> of ${fmtNum(plan.moves.length)} files will move · <strong>${fmtBytes(includedBytes)}</strong> — uncheck anything you want to keep in place</div>
       <div class="dupe-toolbar-spacer"></div>
-      <button class="btn btn-primary" id="btn-org-apply" ${included.length ? '' : 'disabled'}>Move ${fmtNum(included.length)} files</button>
+      ${O.sessionMoved ? `<button class="btn btn-ghost btn-small" id="btn-org-undo-session">↩ Undo (${fmtNum(O.sessionMoved)} moved)</button>` : ''}
+      <button class="btn btn-primary" id="btn-org-apply" ${included.length ? '' : 'disabled'}>Move all ${fmtNum(included.length)} files</button>
     </div>
 
     <div id="org-groups">
@@ -1659,6 +1664,7 @@ function renderOrganize() {
             <div class="dupe-group-title">→ ${esc(dest)}/</div>
             <div class="dupe-group-meta">${fmtNum(inc.length)} of ${fmtNum(rows.length)} files · ${fmtBytes(inc.reduce((s, m) => s + m.size, 0))}</div>
             <button class="btn btn-ghost btn-small" data-toggle-dest="${esc(dest)}">${inc.length === rows.length ? 'Exclude all' : 'Include all'}</button>
+            <button class="btn btn-ghost btn-small" data-move-dest="${esc(dest)}" ${inc.length ? '' : 'disabled'}>Move these ${fmtNum(inc.length)} now</button>
           </div>
           ${rows.map(m => `
             <div class="dupe-file">
@@ -1674,6 +1680,18 @@ function renderOrganize() {
 
   $('#btn-org-back').addEventListener('click', () => { O.plan = null; renderOrganize(); });
   $('#btn-org-apply').addEventListener('click', applyOrganizePlan);
+  const undoSession = $('#btn-org-undo-session');
+  if (undoSession) undoSession.addEventListener('click', async () => {
+    const res = await api.orgUndo();
+    if (res.error) { toast(res.error, false); return; }
+    toast(`Restored ${fmtNum(res.restored)} files to their original locations`);
+    O.sessionMoved = 0;
+    O.sessionFolders = new Set();
+    const plan = await api.orgPlan(O.folder, { byYear: O.byYear }); // refresh: restored files reappear
+    if (!plan.error) { O.plan = plan; O.excluded = new Set(); }
+    quietRescan();
+    renderOrganize();
+  });
   el.querySelectorAll('[data-toggle-dest]').forEach(btn => btn.addEventListener('click', () => {
     const dest = btn.dataset.toggleDest;
     const rows = byDest.get(dest);
@@ -1681,6 +1699,7 @@ function renderOrganize() {
     rows.forEach(m => { if (allIncluded) O.excluded.add(m.from); else O.excluded.delete(m.from); });
     renderOrganize();
   }));
+  el.querySelectorAll('[data-move-dest]').forEach(btn => btn.addEventListener('click', () => applyOrganizeGroup(btn.dataset.moveDest)));
   $('#org-groups').addEventListener('change', e => {
     const cb = e.target.closest('input[type="checkbox"]');
     if (!cb) return;
@@ -1704,10 +1723,37 @@ async function applyOrganizePlan() {
 
   const res = await api.orgApply(O.plan.folder, included.map(m => ({ from: m.from, destDir: m.destDir })));
   if (res.error) { toast(res.error, false); return; }
-  O.lastResult = { moved: res.moved, failed: res.failed, folders };
+  O.sessionMoved += res.moved;
+  included.forEach(m => O.sessionFolders.add(m.destDir));
+  O.lastResult = { moved: O.sessionMoved, failed: res.failed, folders: O.sessionFolders.size };
+  O.plan = null;
   if (res.failed.length) toast(`Moved ${fmtNum(res.moved)} files — ${fmtNum(res.failed.length)} failed`, false);
   else toast(`Organized ${fmtNum(res.moved)} files into ${fmtNum(folders)} folders`);
   quietRescan();
+  renderOrganize();
+}
+
+async function applyOrganizeGroup(dest) {
+  const O = S.org;
+  const included = O.plan.moves.filter(m => m.destDir === dest && !O.excluded.has(m.from));
+  if (!included.length) return;
+
+  const res = await api.orgApply(O.plan.folder, included.map(m => ({ from: m.from, destDir: m.destDir })));
+  if (res.error) { toast(res.error, false); return; }
+  const failedFrom = new Set(res.failed.map(f => f.from));
+  const movedFrom = new Set(included.filter(m => !failedFrom.has(m.from)).map(m => m.from));
+  O.plan.moves = O.plan.moves.filter(m => !movedFrom.has(m.from));
+  O.sessionMoved += res.moved;
+  if (res.moved) O.sessionFolders.add(dest);
+
+  if (res.failed.length) toast(`Moved ${fmtNum(res.moved)} → ${dest}/ — ${fmtNum(res.failed.length)} failed`, false);
+  else toast(`Moved ${fmtNum(res.moved)} files → ${dest}/ — undo available`);
+  quietRescan();
+
+  if (!O.plan.moves.length) {
+    O.lastResult = { moved: O.sessionMoved, failed: res.failed, folders: O.sessionFolders.size };
+    O.plan = null;
+  }
   renderOrganize();
 }
 
