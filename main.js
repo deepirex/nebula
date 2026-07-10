@@ -70,6 +70,19 @@ function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
+// Destructive/read operations are only honored inside folders the user has
+// explicitly opened (scan, compare, organize). A compromised renderer cannot
+// reach outside them.
+const authorizedRoots = new Set();
+function authorize(p) { if (p) authorizedRoots.add(p); }
+function isAuthorized(p) {
+  if (typeof p !== 'string' || !p) return false;
+  for (const r of authorizedRoots) {
+    if (p === r || (p.startsWith(r) && (r.endsWith(path.sep) || p[r.length] === path.sep))) return true;
+  }
+  return false;
+}
+
 function fileInfo(f) {
   return {
     name: f.name,
@@ -85,6 +98,7 @@ function fileInfo(f) {
 // ---------------------------------------------------------------- scanning
 
 async function runScan(root) {
+  authorize(root);
   state.root = root;
   state.files = [];
   state.dirIndex = new Map();
@@ -222,6 +236,7 @@ async function loadIndex() {
   const payload = JSON.parse((await gunzip(await fsp.readFile(data))).toString());
   if (payload.v !== INDEX_VERSION) throw new Error('saved index is from an incompatible version');
   const root = payload.root;
+  authorize(root); // the index only ever contains a root the user picked to scan
 
   state.root = root;
   state.files = [];
@@ -508,6 +523,7 @@ function classifyForOrganize(name, ext, mtime, byYear) {
 }
 
 async function buildOrganizePlan(folder, opts = {}) {
+  authorize(folder);
   const byYear = !!opts.byYear;
   const entries = await fsp.readdir(folder, { withFileTypes: true });
   const moves = [];
@@ -637,6 +653,8 @@ async function collectFiles(root, sideLabel) {
 }
 
 async function compareRoots(rootA, rootB) {
+  authorize(rootA);
+  authorize(rootB);
   cmp.running = true;
   cmp.cancelled = false;
 
@@ -1084,6 +1102,14 @@ ipcMain.handle('org:plan', async (_e, folder, opts) => {
 
 ipcMain.handle('org:apply', async (_e, folder, moves) => {
   try {
+    if (!isAuthorized(folder)) return { error: 'Folder not authorized — preview it first.' };
+    if (!Array.isArray(moves)) return { error: 'Invalid move list.' };
+    for (const m of moves) {
+      if (!isAuthorized(m.from) || path.dirname(m.from) !== folder) return { error: 'Move source outside the organized folder.' };
+      if (typeof m.destDir !== 'string' || path.isAbsolute(m.destDir) || m.destDir.split(/[\\/]/).some(s => s === '..' || s === '')) {
+        return { error: 'Invalid destination folder.' };
+      }
+    }
     const res = await applyOrganize(folder, moves);
     return { moved: res.moved.length, failed: res.failed };
   } catch (err) { return { error: String(err.message || err) }; }
@@ -1156,7 +1182,9 @@ ipcMain.handle('dupes:cancel', () => { state.dupeCancelled = true; return true; 
 ipcMain.handle('files:trash', async (_e, paths) => {
   const trashed = [];
   const failed = [];
+  if (!Array.isArray(paths)) return { trashed, failed };
   for (const p of paths) {
+    if (!isAuthorized(p)) { failed.push({ path: p, error: 'outside authorized folders' }); continue; }
     try {
       await shell.trashItem(p);
       trashed.push(p);
@@ -1193,8 +1221,11 @@ ipcMain.handle('files:trash', async (_e, paths) => {
   return { trashed, failed };
 });
 
-ipcMain.handle('files:reveal', (_e, p) => { shell.showItemInFolder(p); return true; });
-ipcMain.handle('files:open', (_e, p) => shell.openPath(p));
+ipcMain.handle('files:reveal', (_e, p) => {
+  if (!isAuthorized(p)) return false;
+  shell.showItemInFolder(p);
+  return true;
+});
 
 // ---------------------------------------------------------------- window
 
@@ -1212,6 +1243,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -1224,7 +1256,16 @@ function createWindow() {
   }
 }
 
+// Lock down every web contents: no popups, no navigation away from the app,
+// no permission grants (camera, geolocation, …) — the UI never needs any.
+app.on('web-contents-created', (_e, contents) => {
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('will-navigate', e => e.preventDefault());
+});
+
 app.whenReady().then(() => {
+  const { session } = require('electron');
+  session.defaultSession.setPermissionRequestHandler((_wc, _permission, cb) => cb(false));
   if (!process.env.NEBULA_NO_WINDOW) createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0 && !process.env.NEBULA_NO_WINDOW) createWindow(); });
 });

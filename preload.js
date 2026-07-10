@@ -29,7 +29,6 @@ contextBridge.exposeInMainWorld('nebula', {
   orgUndo: () => ipcRenderer.invoke('org:undo'),
   trash: (paths) => ipcRenderer.invoke('files:trash', paths),
   reveal: (p) => ipcRenderer.invoke('files:reveal', p),
-  open: (p) => ipcRenderer.invoke('files:open', p),
   onScanProgress: (cb) => subscribe('scan:progress', cb),
   onDupeProgress: (cb) => subscribe('dupes:progress', cb),
   onPhotoProgress: (cb) => subscribe('photos:progress', cb),

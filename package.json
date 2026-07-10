@@ -1,8 +1,8 @@
 {
   "name": "nebula-storage",
   "productName": "Nebula",
-  "version": "1.4.1",
-  "description": "Storage intelligence — disk usage maps, duplicate detection, and large-file cleanup for macOS and Windows",
+  "version": "1.5.0",
+  "description": "Nebula Disk Organizer — disk usage maps, duplicate detection, similar photos, folder compare, and auto-organization for macOS and Windows",
   "main": "main.js",
   "author": "Nebula",
   "license": "MIT",
@@ -14,7 +14,7 @@
     "electron": "^33.2.0"
   },
   "build": {
-    "appId": "com.nebula.storage",
+    "appId": "com.deepirex.nebula",
     "productName": "Nebula",
     "files": [
       "main.js",
@@ -23,10 +23,35 @@
     ],
     "mac": {
       "category": "public.app-category.utilities",
-      "target": "dmg"
+      "target": "dmg",
+      "icon": "build/icon.png",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "CFBundleDisplayName": "Nebula Disk Organizer",
+        "NSDesktopFolderUsageDescription": "Nebula analyzes folders you choose to show where your storage goes. Grant access to include your Desktop.",
+        "NSDocumentsFolderUsageDescription": "Nebula analyzes folders you choose to show where your storage goes. Grant access to include your Documents.",
+        "NSDownloadsFolderUsageDescription": "Nebula analyzes folders you choose to show where your storage goes. Grant access to include your Downloads.",
+        "NSRemovableVolumesUsageDescription": "Nebula can analyze and compare external drives you choose."
+      }
+    },
+    "mas": {
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.png",
+      "entitlements": "build/entitlements.mas.plist",
+      "entitlementsInherit": "build/entitlements.mas.inherit.plist",
+      "extendInfo": {
+        "CFBundleDisplayName": "Nebula Disk Organizer",
+        "NSDesktopFolderUsageDescription": "Nebula analyzes folders you choose to show where your storage goes. Grant access to include your Desktop.",
+        "NSDocumentsFolderUsageDescription": "Nebula analyzes folders you choose to show where your storage goes. Grant access to include your Documents.",
+        "NSDownloadsFolderUsageDescription": "Nebula analyzes folders you choose to show where your storage goes. Grant access to include your Downloads.",
+        "NSRemovableVolumesUsageDescription": "Nebula can analyze and compare external drives you choose."
+      }
     },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "build/icon.png"
     }
   }
 }
