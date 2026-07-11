@@ -53,7 +53,7 @@ const S = {
   dupeFilters: { sameName: false, minSize: 0, query: '' },
   dupeExpanded: new Set(),
   dupeStrategy: 'smart',
-  largest: { category: null, query: '', rows: [] },
+  largest: { category: null, query: '', rows: [], limit: 150 },
   similar: null,
   photoSelection: new Set(),
   cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80, scope: 'cross' },
@@ -1866,15 +1866,17 @@ async function refreshLargest() {
     el.innerHTML = `
       <div class="view-head"><div>
         <div class="view-title">Largest Files</div>
-        <div class="view-sub">The biggest single wins for reclaiming space</div>
+        <div class="view-sub">Type filters group by file content (Archives = .zip / .dmg / .iso…), wherever the files live — independent of folder names</div>
       </div></div>
       <div class="filter-row" id="largest-filters"></div>
+      <div class="largest-summary" id="largest-summary"></div>
       <div class="panel" style="padding:8px 12px"><div style="overflow-x:auto"><table class="big-table">
         <thead><tr>
           <th class="td-rank">#</th><th>Name</th><th>Type</th><th style="text-align:right">Size</th><th></th><th>Modified</th><th></th>
         </tr></thead>
         <tbody id="largest-body"></tbody>
-      </table></div></div>`;
+      </table></div></div>
+      <div id="largest-more" style="text-align:center;padding:12px"></div>`;
   }
 
   $('#largest-filters').innerHTML = [
@@ -1884,7 +1886,7 @@ async function refreshLargest() {
   ].join('');
 
   $('#largest-filters').querySelectorAll('.chip').forEach(ch =>
-    ch.addEventListener('click', () => { S.largest.category = ch.dataset.cat || null; refreshLargest(); }));
+    ch.addEventListener('click', () => { S.largest.category = ch.dataset.cat || null; S.largest.limit = 150; refreshLargest(); }));
   $('#largest-search').addEventListener('input', debounce(e => {
     S.largest.query = e.target.value;
     fetchLargestRows();
@@ -1895,8 +1897,34 @@ async function refreshLargest() {
 }
 
 async function fetchLargestRows() {
-  const rows = await api.largest({ limit: 150, category: S.largest.category, query: S.largest.query });
+  const rows = await api.largest({ limit: S.largest.limit, category: S.largest.category, query: S.largest.query });
   S.largest.rows = rows;
+
+  // honest accounting: the list shows the top N — say what the full group holds
+  const summary = $('#largest-summary');
+  if (summary) {
+    const shownBytes = rows.reduce((s, f) => s + f.size, 0);
+    if (S.largest.query) {
+      summary.innerHTML = `Showing the <strong>${fmtNum(rows.length)}</strong> largest matches (${esc(fmtBytes(shownBytes))})`;
+    } else if (S.largest.category) {
+      const cat = S.overview && S.overview.categories.find(c => c.key === S.largest.category);
+      summary.innerHTML = cat
+        ? `<strong>${esc(cat.key)}</strong> holds <strong>${esc(fmtBytes(cat.bytes))}</strong> across ${fmtNum(cat.count)} files in all folders — the <strong>${fmtNum(rows.length)}</strong> largest below account for ${esc(fmtBytes(shownBytes))}; the rest is spread over many smaller files`
+        : '';
+    } else if (S.overview) {
+      summary.innerHTML = `<strong>${esc(fmtBytes(S.overview.totalBytes))}</strong> in ${fmtNum(S.overview.fileCount)} files — showing the <strong>${fmtNum(rows.length)}</strong> largest (${esc(fmtBytes(shownBytes))})`;
+    }
+  }
+
+  const more = $('#largest-more');
+  if (more) {
+    more.innerHTML = (rows.length >= S.largest.limit && S.largest.limit < 1000)
+      ? `<button class="btn btn-ghost" id="btn-largest-more">Show ${Math.min(200, 1000 - S.largest.limit)} more</button>`
+      : '';
+    const btn = $('#btn-largest-more');
+    if (btn) btn.addEventListener('click', () => { S.largest.limit = Math.min(1000, S.largest.limit + 200); fetchLargestRows(); });
+  }
+
   const body = $('#largest-body');
   if (!rows.length) {
     body.innerHTML = '<tr><td colspan="7"><div class="empty-note">No files match.</div></td></tr>';

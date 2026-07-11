@@ -461,6 +461,9 @@ body {
 .search-input:focus { border-color: rgba(64, 214, 178, 0.5); }
 .search-input::placeholder { color: var(--text-muted); }
 
+.largest-summary { font-size: 12.5px; color: var(--text-secondary); margin: -4px 0 14px; line-height: 1.5; }
+.largest-summary strong { color: var(--text-primary); }
+
 .big-table { width: 100%; border-collapse: collapse; }
 .big-table th {
   text-align: left; font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
