@@ -19,8 +19,20 @@ const CAT_COLORS = {
 };
 const catColor = c => CAT_COLORS[c] || CAT_COLORS.Other;
 
-// Sequential teal ramp (dark → light with magnitude), white text stays legible on every step.
-const SIZE_RAMP = ['#0b4237', '#0e5143', '#126050', '#166f5c', '#1a7e68', '#1f8e75', '#259e82', '#2cae8f'];
+// Treemap tile palette: size is already encoded by AREA, so color encodes
+// IDENTITY — each folder gets a stable, distinct muted hue (by name hash),
+// all tuned for white labels. The contents list reuses the same color.
+const TM_COLORS = [
+  '#1f8e75', '#31699f', '#7c5cc4', '#a8712c', '#537d2f',
+  '#b3536e', '#0e8a8a', '#8a6ee0', '#996f22', '#3d8f55',
+  '#a25b3b', '#4a78c2',
+];
+function nameHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+const tmColor = name => TM_COLORS[nameHash(name) % TM_COLORS.length];
 
 const ICON_FOLDER = '<svg viewBox="0 0 24 24"><path d="M3 5a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a1 1 0 0 0 .8.4H19a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Z"/></svg>';
 const ICON_FILE = '<svg viewBox="0 0 24 24"><path d="M6 2h8l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V8h4.5L13 3.5Z"/></svg>';
@@ -354,7 +366,7 @@ async function renderDashboard() {
 
     <div class="dash-grid">
       <div class="panel">
-        <div class="panel-title">Storage by type</div>
+        <div class="panel-title">Storage by type <span class="panel-hint">click a slice to see its files</span></div>
         <div class="donut-wrap">
           <div id="donut-holder"></div>
           <div class="legend" id="donut-legend"></div>
@@ -401,6 +413,7 @@ function buildDonut(o) {
     let a = -Math.PI / 2;
     cats.forEach((c, i) => {
       const frac = c.bytes / totalB;
+      if (frac < 0.004) return; // slivers are unreadable and leave stray marks — legend carries them
       const sweep = Math.max(0.008, frac * Math.PI * 2 - gap);
       const a2 = a + sweep;
       const x1 = cx + r * Math.cos(a), y1 = cy + r * Math.sin(a);
@@ -446,13 +459,23 @@ function buildDonut(o) {
     highlight(+t.dataset.i);
     showTooltip(
       `<div class="tt-title">${esc(c.key)}</div>
-       <div class="tt-line">${esc(fmtBytes(c.bytes))} · ${fmtNum(c.count)} files · ${((c.bytes / totalB) * 100).toFixed(1)}%</div>`,
+       <div class="tt-line">${esc(fmtBytes(c.bytes))} · ${fmtNum(c.count)} files · ${((c.bytes / totalB) * 100).toFixed(1)}% · click to view files</div>`,
       e.clientX, e.clientY);
+  };
+  const goto = e => {
+    const t = e.target.closest('[data-i]');
+    if (!t) return;
+    hideTooltip();
+    S.largest.category = cats[+t.dataset.i].key;
+    S.largest.query = '';
+    setView('largest');
   };
   svgEl.addEventListener('mousemove', onOver);
   svgEl.addEventListener('mouseleave', () => { highlight(null); hideTooltip(); });
+  svgEl.addEventListener('click', goto);
   $('#donut-legend').addEventListener('mousemove', onOver);
   $('#donut-legend').addEventListener('mouseleave', () => { highlight(null); hideTooltip(); });
+  $('#donut-legend').addEventListener('click', goto);
 }
 
 function buildTopDirs(o) {
@@ -632,7 +655,6 @@ function renderTreemap(node) {
   }
 
   const GAP = 2;
-  const maxV = items[0].value;
   const rects = squarify(items, W, H);
 
   holder.innerHTML = rects.map((r, i) => {
@@ -640,12 +662,13 @@ function renderTreemap(node) {
     if (w < 3 || h < 3) return '';
     let bg;
     if (r.isRest) bg = 'rgba(255,255,255,0.08)';
-    else if (r.isDir) bg = SIZE_RAMP[Math.min(SIZE_RAMP.length - 1, Math.round(Math.sqrt(r.value / maxV) * (SIZE_RAMP.length - 1)))];
+    else if (r.isDir) bg = tmColor(r.name);
     else bg = '#3d4a44';
-    const showText = w > 64 && h > 34;
+    const showName = w > 46 && h > 22;
+    const showSize = w > 46 && h > 38;
     return `<div class="tm-rect tm-in ${r.isDir ? '' : 'tm-file'}" data-i="${i}"
       style="left:${r.x + GAP / 2}px;top:${r.y + GAP / 2}px;width:${w}px;height:${h}px;background:${bg};--i:${Math.min(i, 28)}">
-      ${showText ? `<div class="tm-name">${esc(r.name)}</div><div class="tm-size">${esc(fmtBytes(r.value))}</div>` : ''}
+      ${showName ? `<div class="tm-name">${esc(r.name)}</div>` : ''}${showSize ? `<div class="tm-size">${esc(fmtBytes(r.value))}</div>` : ''}
     </div>`;
   }).join('');
 
@@ -682,7 +705,7 @@ function renderDirList(node) {
         <div class="dir-row-name">${esc(c.name)}</div>
         ${c.isDir ? `<div class="dir-row-count">${fmtNum(c.fileCount)} files</div>` : ''}
       </div>
-      <div class="bar-track"><div class="bar-fill" style="width:${((c.size / max) * 100).toFixed(1)}%;${c.isDir ? '' : 'background:#6b7280'}"></div></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${((c.size / max) * 100).toFixed(1)}%;background:${c.isDir ? tmColor(c.name) : '#6b7280'}"></div></div>
       <div class="bar-row-size">${fmtBytes(c.size)}</div>
     </div>`).join('') || '<div class="empty-note">Empty folder</div>';
 
