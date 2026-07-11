@@ -39,6 +39,17 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
 - Works across all file types and sizes; symlinks are never followed (no cycles,
   no double-counting). Unreadable items are skipped and counted.
 
+## Download
+
+Grab the installer for your device from the
+[latest release](https://github.com/deepirex/nebula/releases/latest):
+
+| Your computer | File |
+|---|---|
+| Mac — Apple Silicon (M1/M2/M3/M4) | `…Mac-AppleSilicon.dmg` |
+| Mac — Intel | `…Mac-Intel.dmg` |
+| Windows 10/11 | `…Windows.exe` |
+
 ## Run it
 
 ```bash

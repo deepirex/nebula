@@ -1,7 +1,7 @@
 {
   "name": "nebula-storage",
   "productName": "Nebula",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "description": "Nebula Disk Organizer — disk usage maps, duplicate detection, similar photos, folder compare, and auto-organization for macOS and Windows",
   "main": "main.js",
   "author": "Nebula",
