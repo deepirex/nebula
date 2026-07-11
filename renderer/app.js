@@ -19,8 +19,8 @@ const CAT_COLORS = {
 };
 const catColor = c => CAT_COLORS[c] || CAT_COLORS.Other;
 
-// Sequential blue ramp (dark → light with magnitude), white text stays legible on every step.
-const SIZE_RAMP = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7'];
+// Sequential teal ramp (dark → light with magnitude), white text stays legible on every step.
+const SIZE_RAMP = ['#0b4237', '#0e5143', '#126050', '#166f5c', '#1a7e68', '#1f8e75', '#259e82', '#2cae8f'];
 
 const ICON_FOLDER = '<svg viewBox="0 0 24 24"><path d="M3 5a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a1 1 0 0 0 .8.4H19a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Z"/></svg>';
 const ICON_FILE = '<svg viewBox="0 0 24 24"><path d="M6 2h8l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V8h4.5L13 3.5Z"/></svg>';
@@ -109,6 +109,47 @@ function moveTooltip(x, y) {
 }
 function hideTooltip() { tooltipEl.hidden = true; }
 
+// ------------------------------------------------------------- motion layer
+
+// Panels/KPIs cascade in when a view is entered or fresh results land —
+// but NOT on every checkbox-driven re-render (S.animNext gates it).
+function animateIn(rootEl) {
+  rootEl.querySelectorAll('.kpi, .panel').forEach((n, i) => {
+    n.style.setProperty('--i', Math.min(i, 14));
+    n.classList.add('rise');
+  });
+}
+
+function countUp(el, target, formatter, dur = 750) {
+  const start = performance.now();
+  const frame = now => {
+    const t = Math.min(1, (now - start) / dur);
+    const eased = 1 - Math.pow(1 - t, 3);
+    el.innerHTML = formatter(target * eased);
+    if (t < 1) requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+function animateCounters(rootEl) {
+  rootEl.querySelectorAll('[data-bytes]').forEach(el =>
+    countUp(el, +el.dataset.bytes, v => {
+      const p = fmtBytesParts(v);
+      return `${p.num}<small>${p.unit}</small>`;
+    }));
+  rootEl.querySelectorAll('[data-num]').forEach(el =>
+    countUp(el, +el.dataset.num, v => fmtNum(Math.round(v))));
+}
+
+function maybeAnimate(el) {
+  if (!S.animNext) return;
+  S.animNext = false;
+  animateIn(el);
+  animateCounters(el);
+}
+
+const LOADER_DOTS = '<div class="pulse-loader"><span></span><span></span><span></span></div>';
+
 // ------------------------------------------------------------- toast & modal
 
 function toast(msg, ok = true, ms = 4200) {
@@ -143,6 +184,7 @@ function confirmModal({ title, body, confirmLabel = 'Confirm', danger = false })
 
 function setView(name) {
   S.view = name;
+  S.animNext = true;
   $$('.view').forEach(v => { v.hidden = v.id !== `view-${name}`; });
   $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === name));
   if (name === 'dashboard') renderDashboard();
@@ -274,7 +316,7 @@ async function renderDashboard() {
 
   const total = fmtBytesParts(o.totalBytes);
   const dupeKpi = o.duplicates
-    ? `<div class="kpi-value">${fmtBytesParts(o.duplicates.totalWasted).num}<small>${fmtBytesParts(o.duplicates.totalWasted).unit}</small></div>
+    ? `<div class="kpi-value" data-bytes="${o.duplicates.totalWasted}">${fmtBytesParts(o.duplicates.totalWasted).num}<small>${fmtBytesParts(o.duplicates.totalWasted).unit}</small></div>
        <div class="kpi-sub good">${fmtNum(o.duplicates.groupCount)} duplicate sets found</div>`
     : `<div class="kpi-value">—</div>
        <div class="kpi-sub">Not analyzed yet</div>
@@ -291,17 +333,17 @@ async function renderDashboard() {
     <div class="kpi-row">
       <div class="kpi">
         <div class="kpi-label">Total size</div>
-        <div class="kpi-value">${total.num}<small>${total.unit}</small></div>
+        <div class="kpi-value" data-bytes="${o.totalBytes}">${total.num}<small>${total.unit}</small></div>
         <div class="kpi-sub">across all scanned items</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Files</div>
-        <div class="kpi-value">${fmtNum(o.fileCount)}</div>
+        <div class="kpi-value" data-num="${o.fileCount}">${fmtNum(o.fileCount)}</div>
         <div class="kpi-sub">${fmtNum(o.topExtensions.length ? o.topExtensions[0].count : 0)} of the top type “${esc(o.topExtensions.length ? o.topExtensions[0].ext : '—')}”</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Folders</div>
-        <div class="kpi-value">${fmtNum(o.dirCount)}</div>
+        <div class="kpi-value" data-num="${o.dirCount}">${fmtNum(o.dirCount)}</div>
         <div class="kpi-sub">${fmtNum(o.looseCount)} loose files at top level</div>
       </div>
       <div class="kpi">
@@ -342,6 +384,7 @@ async function renderDashboard() {
 
   el.querySelectorAll('[data-action="go-dupes"]').forEach(b =>
     b.addEventListener('click', () => { setView('dupes'); runDupeAnalysis(); }));
+  maybeAnimate(el);
 }
 
 function buildDonut(o) {
@@ -371,6 +414,18 @@ function buildDonut(o) {
   svg += `<text x="${cx}" y="${cy + 15}" text-anchor="middle" class="donut-center-label">total</text>`;
   svg += `</svg>`;
   holder.innerHTML = svg;
+
+  // draw-in: each arc sweeps from zero with a small stagger
+  requestAnimationFrame(() => {
+    holder.querySelectorAll('[data-i]').forEach((p, i) => {
+      let len;
+      try { len = p.getTotalLength(); } catch { return; }
+      p.style.strokeDasharray = `${len} ${len}`;
+      p.style.strokeDashoffset = len;
+      p.classList.add('draw');
+      setTimeout(() => { p.style.strokeDashoffset = 0; }, 60 + i * 70);
+    });
+  });
 
   $('#donut-legend').innerHTML = cats.map((c, i) => `
     <div class="legend-item" data-i="${i}">
@@ -442,7 +497,7 @@ function buildTopExts(o) {
   $('#dash-exts').innerHTML = o.topExtensions.map(x => `
     <div class="bar-row" style="cursor:default">
       <div class="bar-row-name"><span>${esc(x.ext)}</span></div>
-      <div class="bar-track"><div class="bar-fill" style="width:${((x.bytes / max) * 100).toFixed(1)}%;background:#9085e9"></div></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${((x.bytes / max) * 100).toFixed(1)}%;background:#d9a13f"></div></div>
       <div class="bar-row-size">${fmtBytes(x.bytes)}</div>
     </div>`).join('');
 }
@@ -507,6 +562,7 @@ function renderStorage() {
 
   renderTreemap(node);
   renderDirList(node);
+  maybeAnimate(el);
 }
 
 // Squarified treemap layout — items must be sorted by value desc.
@@ -585,10 +641,10 @@ function renderTreemap(node) {
     let bg;
     if (r.isRest) bg = 'rgba(255,255,255,0.08)';
     else if (r.isDir) bg = SIZE_RAMP[Math.min(SIZE_RAMP.length - 1, Math.round(Math.sqrt(r.value / maxV) * (SIZE_RAMP.length - 1)))];
-    else bg = '#3a4152';
+    else bg = '#3d4a44';
     const showText = w > 64 && h > 34;
-    return `<div class="tm-rect ${r.isDir ? '' : 'tm-file'}" data-i="${i}"
-      style="left:${r.x + GAP / 2}px;top:${r.y + GAP / 2}px;width:${w}px;height:${h}px;background:${bg}">
+    return `<div class="tm-rect tm-in ${r.isDir ? '' : 'tm-file'}" data-i="${i}"
+      style="left:${r.x + GAP / 2}px;top:${r.y + GAP / 2}px;width:${w}px;height:${h}px;background:${bg};--i:${Math.min(i, 28)}">
       ${showText ? `<div class="tm-name">${esc(r.name)}</div><div class="tm-size">${esc(fmtBytes(r.value))}</div>` : ''}
     </div>`;
   }).join('');
@@ -657,6 +713,7 @@ function renderDupes() {
         <button class="btn btn-primary" id="btn-run-dupes">Analyze ${S.overview ? fmtNum(S.overview.fileCount) + ' files' : 'scan'}</button>
       </div>`;
     $('#btn-run-dupes').addEventListener('click', runDupeAnalysis);
+    maybeAnimate(el);
     return;
   }
 
@@ -674,6 +731,7 @@ function renderDupes() {
         <button class="btn btn-ghost" id="btn-rerun-dupes">Re-analyze</button>
       </div>`;
     $('#btn-rerun-dupes').addEventListener('click', runDupeAnalysis);
+    maybeAnimate(el);
     return;
   }
 
@@ -756,6 +814,7 @@ function renderDupes() {
     const p = e.target.closest('.dupe-file-path');
     if (p) api.reveal(p.dataset.path);
   });
+  maybeAnimate(el);
 }
 
 // Score each copy in a group; the highest-scoring copy is the one to KEEP.
@@ -865,6 +924,7 @@ async function runDupeAnalysis() {
       <div class="view-sub">Analyzing content…</div>
     </div></div>
     <div class="dupe-progress">
+      ${LOADER_DOTS}
       <div class="dupe-progress-label" id="dupe-phase">Grouping by size…</div>
       <div class="progress-track"><div class="progress-fill" id="dupe-fill" style="width:2%"></div></div>
       <button class="btn btn-ghost" id="btn-cancel-dupes">Cancel</button>
@@ -878,6 +938,7 @@ async function runDupeAnalysis() {
   S.dupes = res;
   S.dupeSelection = new Set();
   S.dupeGroupsShown = 80;
+  S.animNext = true;
 
   const badge = $('#dupe-badge');
   if (res.groupCount > 0) { badge.textContent = fmtNum(res.groupCount); badge.hidden = false; }
@@ -956,6 +1017,7 @@ function renderPhotos() {
         <button class="btn btn-primary" id="btn-run-photos">Analyze ${imgCat ? fmtNum(imgCat.count) + ' images' : 'images'}</button>
       </div>`;
     $('#btn-run-photos').addEventListener('click', runPhotoAnalysis);
+    maybeAnimate(el);
     return;
   }
 
@@ -973,6 +1035,7 @@ function renderPhotos() {
         <button class="btn btn-ghost" id="btn-rerun-photos">Re-analyze</button>
       </div>`;
     $('#btn-rerun-photos').addEventListener('click', runPhotoAnalysis);
+    maybeAnimate(el);
     return;
   }
 
@@ -1018,6 +1081,7 @@ function renderPhotos() {
     const img = e.target.closest('img');
     if (img) api.reveal(img.dataset.path);
   });
+  maybeAnimate(el);
 }
 
 function photoClusterHtml(c) {
@@ -1070,6 +1134,7 @@ async function runPhotoAnalysis() {
       <div class="view-sub">Computing perceptual fingerprints…</div>
     </div></div>
     <div class="dupe-progress">
+      ${LOADER_DOTS}
       <div class="dupe-progress-label" id="photo-phase">Preparing…</div>
       <div class="progress-track"><div class="progress-fill" id="photo-fill" style="width:2%"></div></div>
       <button class="btn btn-ghost" id="btn-cancel-photos">Cancel</button>
@@ -1081,6 +1146,7 @@ async function runPhotoAnalysis() {
   if (res && res.cancelled) { toast('Photo analysis cancelled'); S.similar = null; renderPhotos(); return; }
   S.similar = res;
   S.photoSelection = new Set();
+  S.animNext = true;
   renderPhotos();
 }
 
@@ -1139,6 +1205,7 @@ async function renderChanges() {
         <button class="btn btn-primary" id="btn-diff-rescan">Rescan now</button>
       </div>`;
     $('#btn-diff-rescan').addEventListener('click', () => { if (S.root) startScan(S.root); });
+    maybeAnimate(el);
     return;
   }
 
@@ -1229,6 +1296,7 @@ async function renderChanges() {
     const row = e.target.closest('.file-row');
     if (row && row.dataset.path) api.reveal(row.dataset.path);
   });
+  maybeAnimate(el);
 }
 
 // ------------------------------------------------------------- compare
@@ -1265,6 +1333,7 @@ function renderCompare() {
     $('#cmp-pick-a').addEventListener('click', async () => { const p = await api.pickFolder(); if (p) { C.a = p; renderCompare(); } });
     $('#cmp-pick-b').addEventListener('click', async () => { const p = await api.pickFolder(); if (p) { C.b = p; renderCompare(); } });
     $('#btn-run-compare').addEventListener('click', runCompare);
+    maybeAnimate(el);
     return;
   }
 
@@ -1282,6 +1351,7 @@ function renderCompare() {
         <button class="btn btn-ghost" id="btn-new-compare">Compare different folders</button>
       </div>`;
     $('#btn-new-compare').addEventListener('click', () => { C.results = null; C.selection = new Set(); renderCompare(); });
+    maybeAnimate(el);
     return;
   }
 
@@ -1374,6 +1444,7 @@ function renderCompare() {
     const p = e.target.closest('.dupe-file-path');
     if (p) api.reveal(p.dataset.path);
   });
+  maybeAnimate(el);
 }
 
 function cmpGroupHtml(g) {
@@ -1435,6 +1506,7 @@ async function runCompare() {
       <div class="view-sub">${esc(C.a)} vs ${esc(C.b)}</div>
     </div></div>
     <div class="dupe-progress">
+      ${LOADER_DOTS}
       <div class="dupe-progress-label" id="cmp-phase">Scanning both sides…</div>
       <div class="dupe-progress-label" id="cmp-sides" style="font-variant-numeric:tabular-nums"></div>
       <div class="progress-track"><div class="progress-fill" id="cmp-fill" style="width:2%"></div></div>
@@ -1452,6 +1524,7 @@ async function runCompare() {
   C.selection = new Set();
   C.expanded = new Set();
   C.shown = 80;
+  S.animNext = true;
   renderCompare();
 }
 
@@ -1707,6 +1780,7 @@ function renderOrganize() {
     else O.excluded.add(cb.dataset.from);
     renderOrganize();
   });
+  maybeAnimate(el);
 }
 
 async function applyOrganizePlan() {
@@ -1794,6 +1868,7 @@ async function refreshLargest() {
   }, 250));
 
   await fetchLargestRows();
+  maybeAnimate(el);
 }
 
 async function fetchLargestRows() {
