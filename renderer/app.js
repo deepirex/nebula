@@ -195,16 +195,74 @@ function confirmModal({ title, body, confirmLabel = 'Confirm', danger = false })
 // ------------------------------------------------------------- navigation
 
 // Views that have nothing to show until a folder has been scanned. Clicking
-// one of these before any scan routes to the welcome screen (where scanning
-// starts) so the nav item is always a live path, never a dead end.
+// one of these before any scan keeps the tab active but renders a "scan gate"
+// — copy explaining what the view does plus a call to action to start a scan —
+// so it never looks like the app failed to respond.
 const NEEDS_SCAN = new Set(['dashboard', 'storage', 'dupes', 'largest', 'photos', 'changes']);
 
+// Per-view copy + icon shown on the scan gate. Icons reuse the sidebar glyphs.
+const SCAN_GATE = {
+  dashboard: {
+    icon: 'M4 13h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1Zm0 8h6a1 1 0 0 0 1-1v-4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v4a1 1 0 0 0 1 1Zm10 0h6a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1Zm-1-17v4a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1Z',
+    title: 'Your storage dashboard',
+    body: 'Scan a folder or drive to see where your space goes — totals, category breakdown, and your biggest storage offenders at a glance.',
+  },
+  storage: {
+    icon: 'M3 5a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a1 1 0 0 0 .8.4H19a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Z',
+    title: 'Storage map',
+    body: 'Scan a folder to explore an interactive treemap of every subfolder, each tile sized by how much disk it uses.',
+  },
+  dupes: {
+    icon: 'M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2Zm2 0h5a2 2 0 0 1 2 2v5h2V5h-9v2Z',
+    title: 'Find duplicate files',
+    body: 'Scan a folder and Nebula content-verifies matching files so you can safely reclaim space by trashing the copies you don’t need.',
+  },
+  largest: {
+    icon: 'M4 20a1 1 0 0 1-1-1v-5h4v6H4Zm6 0v-10h4v10h-4Zm6 0V4h4v15a1 1 0 0 1-1 1h-3Z',
+    title: 'Your largest files',
+    body: 'Scan a folder to surface the biggest files taking up space, sorted by size and filterable by type.',
+  },
+  photos: {
+    icon: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm3.5 4A2.5 2.5 0 1 0 11 9.5 2.5 2.5 0 0 0 8.5 7ZM5 19h14l-4.5-7-3.5 4.5-2-2.5L5 19Z',
+    title: 'Find similar photos',
+    body: 'Scan a folder to detect visually similar and near-duplicate photos, grouped so you can review and clean them up.',
+  },
+  changes: {
+    icon: 'M3 17.5 9 11l4 4 7.3-8.2 1.4 1.3L13 18l-4-4-4.6 5H21v2H3v-3.5Z',
+    title: 'Changes since last scan',
+    body: 'Scan a folder once, then rescan later and Nebula shows exactly what was added, what grew, and what was deleted.',
+  },
+};
+
+function renderScanGate(name) {
+  const g = SCAN_GATE[name];
+  const idx = S.savedIndex;
+  const resumeHtml = idx ? `
+      <button class="btn btn-ghost scan-gate-resume">⚡ Resume ${esc(idx.name || idx.root)} — ${esc(fmtBytes(idx.totalBytes))} · ${fmtNum(idx.fileCount)} files</button>` : '';
+  const el = $(`#view-${name}`);
+  el.innerHTML = `
+    <div class="scan-gate">
+      <div class="scan-gate-orb"><svg viewBox="0 0 24 24"><path d="${g.icon}"/></svg></div>
+      <h2 class="scan-gate-title">${g.title}</h2>
+      <p class="scan-gate-body">${g.body}</p>
+      <button class="btn btn-primary btn-large scan-gate-choose">
+        <svg viewBox="0 0 24 24" class="icon-16"><path d="M3 5a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a1 1 0 0 0 .8.4H19a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Z"/></svg>
+        Choose a folder to scan…
+      </button>
+      <p class="scan-gate-hint">Nothing is moved or deleted — scanning only reads your files to analyze them.</p>
+      ${resumeHtml}
+    </div>`;
+  el.querySelector('.scan-gate-choose').addEventListener('click', chooseFolderToScan);
+  const r = el.querySelector('.scan-gate-resume');
+  if (r) r.addEventListener('click', () => resumeSavedIndex(r));
+}
+
 function setView(name) {
-  if (NEEDS_SCAN.has(name) && !S.overview) name = 'welcome';
   S.view = name;
   S.animNext = true;
   $$('.view').forEach(v => { v.hidden = v.id !== `view-${name}`; });
   $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  if (NEEDS_SCAN.has(name) && !S.overview) { renderScanGate(name); return; }
   if (name === 'dashboard') renderDashboard();
   if (name === 'storage') { if (!S.storageDir) S.storageDir = S.root; loadStorage(S.storageDir); }
   if (name === 'dupes') renderDupes();
@@ -281,10 +339,12 @@ $('#btn-newscan').addEventListener('click', async () => {
   const p = await api.pickFolder();
   if (p) startScan(p);
 });
-$('#btn-choose').addEventListener('click', async () => {
+async function chooseFolderToScan() {
   const p = await api.pickFolder();
   if (p) startScan(p);
-});
+}
+
+$('#btn-choose').addEventListener('click', chooseFolderToScan);
 
 (async function initQuickFolders() {
   const folders = await api.quickFolders();
@@ -297,31 +357,33 @@ $('#btn-choose').addEventListener('click', async () => {
   });
 })();
 
+// Restore the previously saved index. Shared by the welcome screen and the
+// per-view scan gate; `btn` (optional) is disabled/relabelled while it loads.
+async function resumeSavedIndex(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Restoring index…'; }
+  const res = await api.indexLoad();
+  if (res && res.error) {
+    toast(`Couldn't restore: ${res.error}`, false);
+    if (btn) { btn.disabled = false; btn.textContent = 'Resume last session'; }
+    return;
+  }
+  S.root = res.root;
+  S.storageDir = null;
+  S.overview = await api.overview();
+  enableNav();
+  updateRootCard(res);
+  toast('Previous scan restored instantly — hit Rescan if the folder changed');
+  setView('dashboard');
+}
+
 (async function initResume() {
   const info = await api.indexInfo();
   if (!info) return;
+  S.savedIndex = info; // let the scan gate offer a one-click resume too
   $('#resume-holder').innerHTML = `
     <div class="quick-label">previous session</div>
     <button class="btn btn-ghost" id="btn-resume">⚡ Resume ${esc(info.name || info.root)} — ${esc(fmtBytes(info.totalBytes))} · ${fmtNum(info.fileCount)} files · scanned ${esc(fmtDate(info.savedAt))}</button>`;
-  $('#btn-resume').addEventListener('click', async () => {
-    const btn = $('#btn-resume');
-    btn.disabled = true;
-    btn.textContent = 'Restoring index…';
-    const res = await api.indexLoad();
-    if (res && res.error) {
-      toast(`Couldn't restore: ${res.error}`, false);
-      btn.disabled = false;
-      btn.textContent = 'Resume last session';
-      return;
-    }
-    S.root = res.root;
-    S.storageDir = null;
-    S.overview = await api.overview();
-    enableNav();
-    updateRootCard(res);
-    toast('Previous scan restored instantly — hit Rescan if the folder changed');
-    setView('dashboard');
-  });
+  $('#btn-resume').addEventListener('click', () => resumeSavedIndex($('#btn-resume')));
 })();
 
 // ------------------------------------------------------------- dashboard
