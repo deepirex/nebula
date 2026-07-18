@@ -194,7 +194,13 @@ function confirmModal({ title, body, confirmLabel = 'Confirm', danger = false })
 
 // ------------------------------------------------------------- navigation
 
+// Views that have nothing to show until a folder has been scanned. Clicking
+// one of these before any scan routes to the welcome screen (where scanning
+// starts) so the nav item is always a live path, never a dead end.
+const NEEDS_SCAN = new Set(['dashboard', 'storage', 'dupes', 'largest', 'photos', 'changes']);
+
 function setView(name) {
+  if (NEEDS_SCAN.has(name) && !S.overview) name = 'welcome';
   S.view = name;
   S.animNext = true;
   $$('.view').forEach(v => { v.hidden = v.id !== `view-${name}`; });
