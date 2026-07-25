@@ -59,6 +59,11 @@ const S = {
   cmp: { a: null, b: null, results: null, selection: new Set(), expanded: new Set(), shown: 80, scope: 'cross' },
   org: { folder: null, byYear: false, plan: null, excluded: new Set(), lastResult: null, sessionMoved: 0, sessionFolders: new Set() },
   scanning: false,
+  // A "native operation" (duplicate / photo analysis / compare) runs in the main
+  // process and streams progress into its own view. We remember the one in flight
+  // so navigating away and back re-renders its live progress instead of the view's
+  // idle state, and so other views can show that something is already running.
+  op: null, // { view, label, progress } while an operation is in flight, else null
 };
 
 // ------------------------------------------------------------- helpers
@@ -258,6 +263,10 @@ function renderScanGate(name) {
 }
 
 function setView(name) {
+  // A folder scan is a global operation with its own live progress screen. While
+  // it runs, scan-dependent tabs have nothing stable to show, so route them back
+  // to the running scan instead of a stale or empty state.
+  if (S.scanning && NEEDS_SCAN.has(name)) name = 'scanning';
   S.view = name;
   S.animNext = true;
   $$('.view').forEach(v => { v.hidden = v.id !== `view-${name}`; });
@@ -791,7 +800,11 @@ function renderDirList(node) {
 function renderDupes() {
   const el = $('#view-dupes');
 
+  // An analysis started here is still running — re-show its live progress.
+  if (S.op && S.op.view === 'dupes') { renderDupeProgress(); return; }
+
   if (!S.dupes) {
+    const busy = S.op || S.scanning; // a different operation is holding the app
     el.innerHTML = `
       <div class="view-head"><div>
         <div class="view-title">Duplicates</div>
@@ -801,7 +814,7 @@ function renderDupes() {
         <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2Zm2 0h5a2 2 0 0 1 2 2v5h2V5h-9v2Z"/></svg></div>
         <h3>Find duplicate files</h3>
         <p>Nebula groups files by exact size, fingerprints candidates, then confirms matches with full content hashes — so identical names aren't enough and identical content never escapes.</p>
-        <button class="btn btn-primary" id="btn-run-dupes">Analyze ${S.overview ? fmtNum(S.overview.fileCount) + ' files' : 'scan'}</button>
+        <button class="btn btn-primary" id="btn-run-dupes" ${busy ? 'disabled' : ''}>${busy ? `${esc(S.op ? S.op.label : 'Scanning')}…` : `Analyze ${S.overview ? fmtNum(S.overview.fileCount) + ' files' : 'scan'}`}</button>
       </div>`;
     $('#btn-run-dupes').addEventListener('click', runDupeAnalysis);
     maybeAnimate(el);
@@ -1007,7 +1020,10 @@ function updateDupeToolbar() {
   if (clearBtn) clearBtn.disabled = !S.dupeSelection.size;
 }
 
-async function runDupeAnalysis() {
+// Draw the duplicate-analysis progress screen. Called both when the run starts
+// and when the user navigates back to the tab mid-run, so it re-applies the last
+// progress payload to restore the phase text and bar rather than resetting them.
+function renderDupeProgress() {
   const el = $('#view-dupes');
   el.innerHTML = `
     <div class="view-head"><div>
@@ -1021,8 +1037,16 @@ async function runDupeAnalysis() {
       <button class="btn btn-ghost" id="btn-cancel-dupes">Cancel</button>
     </div>`;
   $('#btn-cancel-dupes').addEventListener('click', () => api.cancelDupes());
+  if (S.op && S.op.view === 'dupes' && S.op.progress) applyDupeProgress(S.op.progress);
+}
+
+async function runDupeAnalysis() {
+  if (S.scanning || S.op) { toast('Please wait — an analysis is already running', false); return; }
+  S.op = { view: 'dupes', label: 'Analyzing duplicates', progress: null };
+  renderDupeProgress();
 
   const res = await api.findDuplicates();
+  S.op = null;
   if (res && res.error) { toast(res.error, false); S.dupes = null; renderDupes(); return; }
   if (res && res.cancelled) { toast('Duplicate analysis cancelled'); S.dupes = null; renderDupes(); return; }
 
@@ -1038,7 +1062,7 @@ async function runDupeAnalysis() {
   renderDupes();
 }
 
-api.onDupeProgress(p => {
+function applyDupeProgress(p) {
   const phase = $('#dupe-phase'), fill = $('#dupe-fill');
   if (!phase || !fill) return;
   const pct = p.total ? (p.done / p.total) * 100 : 100;
@@ -1049,6 +1073,11 @@ api.onDupeProgress(p => {
     phase.textContent = `Pass 2 of 2 — verifying content of ${fmtNum(p.total)} files (${fmtNum(p.done)} done)`;
     fill.style.width = `${(45 + pct * 0.55).toFixed(1)}%`;
   }
+}
+
+api.onDupeProgress(p => {
+  if (S.op && S.op.view === 'dupes') S.op.progress = p; // remember for re-renders on return
+  applyDupeProgress(p);
 });
 
 async function trashSelectedDupes() {
@@ -1094,8 +1123,12 @@ function fileUrl(p) {
 function renderPhotos() {
   const el = $('#view-photos');
 
+  // An analysis started here is still running — re-show its live progress.
+  if (S.op && S.op.view === 'photos') { renderPhotoProgress(); return; }
+
   if (!S.similar) {
     const imgCat = S.overview && S.overview.categories.find(c => c.key === 'Images');
+    const busy = S.op || S.scanning; // a different operation is holding the app
     el.innerHTML = `
       <div class="view-head"><div>
         <div class="view-title">Similar Photos</div>
@@ -1105,7 +1138,7 @@ function renderPhotos() {
         <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm3.5 4A2.5 2.5 0 1 0 11 9.5 2.5 2.5 0 0 0 8.5 7ZM5 19h14l-4.5-7-3.5 4.5-2-2.5L5 19Z"/></svg></div>
         <h3>Find visually similar photos</h3>
         <p>Nebula computes a perceptual fingerprint of every image and clusters ones that look alike, then recommends keeping the sharpest (highest-resolution) version of each.</p>
-        <button class="btn btn-primary" id="btn-run-photos">Analyze ${imgCat ? fmtNum(imgCat.count) + ' images' : 'images'}</button>
+        <button class="btn btn-primary" id="btn-run-photos" ${busy ? 'disabled' : ''}>${busy ? `${esc(S.op ? S.op.label : 'Scanning')}…` : `Analyze ${imgCat ? fmtNum(imgCat.count) + ' images' : 'images'}`}</button>
       </div>`;
     $('#btn-run-photos').addEventListener('click', runPhotoAnalysis);
     maybeAnimate(el);
@@ -1217,7 +1250,9 @@ function renderPhotoToolbar() {
   if (clearBtn) clearBtn.disabled = !S.photoSelection.size;
 }
 
-async function runPhotoAnalysis() {
+// Draw the photo-analysis progress screen; re-applies the last progress payload
+// so navigating back to the tab mid-run restores the phase text and bar.
+function renderPhotoProgress() {
   const el = $('#view-photos');
   el.innerHTML = `
     <div class="view-head"><div>
@@ -1231,8 +1266,16 @@ async function runPhotoAnalysis() {
       <button class="btn btn-ghost" id="btn-cancel-photos">Cancel</button>
     </div>`;
   $('#btn-cancel-photos').addEventListener('click', () => api.cancelPhotos());
+  if (S.op && S.op.view === 'photos' && S.op.progress) applyPhotoProgress(S.op.progress);
+}
+
+async function runPhotoAnalysis() {
+  if (S.scanning || S.op) { toast('Please wait — an analysis is already running', false); return; }
+  S.op = { view: 'photos', label: 'Analyzing photos', progress: null };
+  renderPhotoProgress();
 
   const res = await api.findSimilarPhotos();
+  S.op = null;
   if (res && res.error) { toast(res.error, false); S.similar = null; renderPhotos(); return; }
   if (res && res.cancelled) { toast('Photo analysis cancelled'); S.similar = null; renderPhotos(); return; }
   S.similar = res;
@@ -1241,11 +1284,16 @@ async function runPhotoAnalysis() {
   renderPhotos();
 }
 
-api.onPhotoProgress(p => {
+function applyPhotoProgress(p) {
   const phase = $('#photo-phase'), fill = $('#photo-fill');
   if (!phase || !fill) return;
   phase.textContent = `Fingerprinting ${fmtNum(p.total)} images (${fmtNum(p.done)} done)`;
   fill.style.width = `${p.total ? ((p.done / p.total) * 100).toFixed(1) : 100}%`;
+}
+
+api.onPhotoProgress(p => {
+  if (S.op && S.op.view === 'photos') S.op.progress = p; // remember for re-renders on return
+  applyPhotoProgress(p);
 });
 
 async function trashSelectedPhotos() {
@@ -1398,6 +1446,9 @@ function renderCompare() {
   const el = $('#view-compare');
   const C = S.cmp;
 
+  // A comparison started here is still running — re-show its live progress.
+  if (S.op && S.op.view === 'compare') { renderCompareProgress(); return; }
+
   if (!C.results) {
     el.innerHTML = `
       <div class="view-head"><div>
@@ -1418,7 +1469,7 @@ function renderCompare() {
         </div>
       </div>
       <div style="text-align:center">
-        <button class="btn btn-primary btn-large" id="btn-run-compare" ${C.a && C.b ? '' : 'disabled'}>Compare contents</button>
+        <button class="btn btn-primary btn-large" id="btn-run-compare" ${C.a && C.b && !S.op && !S.scanning ? '' : 'disabled'}>${S.op || S.scanning ? `${esc(S.op ? S.op.label : 'Scanning')}…` : 'Compare contents'}</button>
         <div class="quick-label" style="margin-top:14px">both sides are scanned fresh — works across internal, external, and network drives</div>
       </div>`;
     $('#cmp-pick-a').addEventListener('click', async () => { const p = await api.pickFolder(); if (p) { C.a = p; renderCompare(); } });
@@ -1588,7 +1639,11 @@ function renderCmpToolbar() {
   if (clearBtn) clearBtn.disabled = !C.selection.size;
 }
 
-async function runCompare() {
+// Draw the compare progress screen; re-applies the last progress payload so
+// navigating back to the tab mid-run restores the phase text, per-side counts,
+// and bar. Per-side stats live on window.__cmpSides, which persists across the
+// re-render, so returning shows the running totals rather than blanks.
+function renderCompareProgress() {
   const C = S.cmp;
   const el = $('#view-compare');
   el.innerHTML = `
@@ -1604,11 +1659,18 @@ async function runCompare() {
       <button class="btn btn-ghost" id="btn-cancel-cmp">Cancel</button>
     </div>`;
   $('#btn-cancel-cmp').addEventListener('click', () => api.compareCancel());
+  if (S.op && S.op.view === 'compare' && S.op.progress) applyCompareProgress(S.op.progress);
+}
 
-  const sideStats = { A: { files: 0, bytes: 0 }, B: { files: 0, bytes: 0 } };
-  window.__cmpSides = sideStats; // updated by the progress listener below
+async function runCompare() {
+  if (S.scanning || S.op) { toast('Please wait — an operation is already running', false); return; }
+  const C = S.cmp;
+  S.op = { view: 'compare', label: 'Comparing folders', progress: null };
+  window.__cmpSides = { A: { files: 0, bytes: 0 }, B: { files: 0, bytes: 0 } }; // updated by the progress listener
+  renderCompareProgress();
 
   const res = await api.compareRun(C.a, C.b);
+  S.op = null;
   if (res && res.error) { toast(res.error, false); C.results = null; renderCompare(); return; }
   if (res && res.cancelled) { toast('Comparison cancelled'); C.results = null; renderCompare(); return; }
   C.results = res;
@@ -1619,7 +1681,7 @@ async function runCompare() {
   renderCompare();
 }
 
-api.onCompareProgress(p => {
+function applyCompareProgress(p) {
   const phase = $('#cmp-phase'), fill = $('#cmp-fill'), sides = $('#cmp-sides');
   if (!phase || !fill) return;
   if (p.phase === 'scan') {
@@ -1635,6 +1697,11 @@ api.onCompareProgress(p => {
     phase.textContent = `Verifying content of ${fmtNum(p.total)} files (${fmtNum(p.done)} done)`;
     fill.style.width = `${(50 + (p.total ? p.done / p.total : 1) * 50).toFixed(1)}%`;
   }
+}
+
+api.onCompareProgress(p => {
+  if (S.op && S.op.view === 'compare') S.op.progress = p; // remember for re-renders on return
+  applyCompareProgress(p);
 });
 
 async function trashSelectedCompare() {
