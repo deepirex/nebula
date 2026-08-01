@@ -13,6 +13,7 @@ const CAT_COLORS = {
   'Audio': '#c98500',
   'Documents': '#008300',
   'Code & Data': '#9085e9',
+  'AI Models': '#8141a4',
   'Archives': '#e66767',
   'Apps & System': '#d55181',
   'Other': '#6b7280',
@@ -267,6 +268,13 @@ function setView(name) {
   // it runs, scan-dependent tabs have nothing stable to show, so route them back
   // to the running scan instead of a stale or empty state.
   if (S.scanning && NEEDS_SCAN.has(name)) name = 'scanning';
+  // Leaving a running operation's screen: nudge once that it keeps going and
+  // can be watched or stopped from the sidebar card.
+  const op = currentOp();
+  if (op && name !== op.view && !busyNavToastShown) {
+    busyNavToastShown = true;
+    toast(`${op.label} is still running — watch or stop it from the sidebar`);
+  }
   S.view = name;
   S.animNext = true;
   $$('.view').forEach(v => { v.hidden = v.id !== `view-${name}`; });
@@ -288,10 +296,58 @@ function enableNav() {
   $$('.nav-item').forEach(b => { b.disabled = false; });
 }
 
+// ------------------------------------------------------------- busy state
+//
+// One native operation runs at a time (folder scan, duplicate/photo analysis,
+// or compare). The sidebar op card makes it visible from EVERY tab and offers
+// a global Stop, so the user never needs to hunt for the tab that started it.
+
+function currentOp() {
+  if (S.scanning) return { view: 'scanning', label: 'Scanning folder', cancel: () => api.cancelScan() };
+  if (S.op) {
+    const cancel = {
+      dupes: () => api.cancelDupes(),
+      photos: () => api.cancelPhotos(),
+      compare: () => api.compareCancel(),
+    }[S.op.view];
+    return { view: S.op.view, label: S.op.label, cancel };
+  }
+  return null;
+}
+
+let busyNavToastShown = false; // one nudge per operation, not one per click
+
+function refreshBusyUI() {
+  const op = currentOp();
+  $('#op-card').hidden = !op;
+  if (op) { $('#op-card-text').textContent = op.label; $('#op-card-sub').innerHTML = '&nbsp;'; }
+  else busyNavToastShown = false;
+  $$('.nav-item').forEach(b => {
+    // Tabs "hosting" the live progress stay bright: the op's own tab, or — for
+    // a folder scan — every scan-dependent tab, since they all route to it.
+    const hosts = op && (b.dataset.view === op.view || (op.view === 'scanning' && NEEDS_SCAN.has(b.dataset.view)));
+    b.classList.toggle('busy-dim', !!op && !hosts);
+  });
+  $('#btn-rescan').disabled = !!op;
+  $('#btn-newscan').disabled = !!op;
+}
+
+function opCardSub(text) {
+  if (!$('#op-card').hidden) $('#op-card-sub').textContent = text;
+}
+
+$('#btn-op-stop').addEventListener('click', () => {
+  const op = currentOp();
+  if (!op) return;
+  op.cancel();
+  toast(`Stopping ${op.label.toLowerCase()}…`);
+});
+
 // ------------------------------------------------------------- scan flow
 
 async function startScan(root) {
   if (S.scanning) return;
+  if (S.op) { toast(`Please wait — ${S.op.label.toLowerCase()} is running. Stop it from the sidebar to scan a new folder.`, false); return; }
   S.scanning = true;
   S.root = root;
   S.storageDir = null;
@@ -301,6 +357,7 @@ async function startScan(root) {
   S.photoSelection = new Set();
   $('#dupe-badge').hidden = true;
 
+  refreshBusyUI();
   setView('scanning');
   $('#scan-target').textContent = root;
   $('#scan-bytes').textContent = '0 B';
@@ -310,6 +367,7 @@ async function startScan(root) {
 
   const res = await api.scan(root);
   S.scanning = false;
+  refreshBusyUI();
 
   if (res && res.error) {
     toast(`Scan failed: ${res.error}`, false);
@@ -330,6 +388,7 @@ async function startScan(root) {
 
 api.onScanProgress(p => {
   if (!S.scanning) return;
+  opCardSub(`${fmtBytes(p.bytes)} · ${fmtNum(p.files)} files`);
   $('#scan-bytes').textContent = fmtBytes(p.bytes);
   $('#scan-files').textContent = fmtNum(p.files);
   $('#scan-dirs').textContent = fmtNum(p.dirs);
@@ -1043,10 +1102,12 @@ function renderDupeProgress() {
 async function runDupeAnalysis() {
   if (S.scanning || S.op) { toast('Please wait — an analysis is already running', false); return; }
   S.op = { view: 'dupes', label: 'Analyzing duplicates', progress: null };
+  refreshBusyUI();
   renderDupeProgress();
 
   const res = await api.findDuplicates();
   S.op = null;
+  refreshBusyUI();
   if (res && res.error) { toast(res.error, false); S.dupes = null; renderDupes(); return; }
   if (res && res.cancelled) { toast('Duplicate analysis cancelled'); S.dupes = null; renderDupes(); return; }
 
@@ -1077,6 +1138,7 @@ function applyDupeProgress(p) {
 
 api.onDupeProgress(p => {
   if (S.op && S.op.view === 'dupes') S.op.progress = p; // remember for re-renders on return
+  opCardSub(`${p.phase === 'quick' ? 'Pass 1 of 2' : 'Pass 2 of 2'} — ${fmtNum(p.done)} / ${fmtNum(p.total)}`);
   applyDupeProgress(p);
 });
 
@@ -1272,10 +1334,12 @@ function renderPhotoProgress() {
 async function runPhotoAnalysis() {
   if (S.scanning || S.op) { toast('Please wait — an analysis is already running', false); return; }
   S.op = { view: 'photos', label: 'Analyzing photos', progress: null };
+  refreshBusyUI();
   renderPhotoProgress();
 
   const res = await api.findSimilarPhotos();
   S.op = null;
+  refreshBusyUI();
   if (res && res.error) { toast(res.error, false); S.similar = null; renderPhotos(); return; }
   if (res && res.cancelled) { toast('Photo analysis cancelled'); S.similar = null; renderPhotos(); return; }
   S.similar = res;
@@ -1293,6 +1357,7 @@ function applyPhotoProgress(p) {
 
 api.onPhotoProgress(p => {
   if (S.op && S.op.view === 'photos') S.op.progress = p; // remember for re-renders on return
+  opCardSub(`${fmtNum(p.done)} / ${fmtNum(p.total)} images`);
   applyPhotoProgress(p);
 });
 
@@ -1666,11 +1731,13 @@ async function runCompare() {
   if (S.scanning || S.op) { toast('Please wait — an operation is already running', false); return; }
   const C = S.cmp;
   S.op = { view: 'compare', label: 'Comparing folders', progress: null };
+  refreshBusyUI();
   window.__cmpSides = { A: { files: 0, bytes: 0 }, B: { files: 0, bytes: 0 } }; // updated by the progress listener
   renderCompareProgress();
 
   const res = await api.compareRun(C.a, C.b);
   S.op = null;
+  refreshBusyUI();
   if (res && res.error) { toast(res.error, false); C.results = null; renderCompare(); return; }
   if (res && res.cancelled) { toast('Comparison cancelled'); C.results = null; renderCompare(); return; }
   C.results = res;
@@ -1701,6 +1768,7 @@ function applyCompareProgress(p) {
 
 api.onCompareProgress(p => {
   if (S.op && S.op.view === 'compare') S.op.progress = p; // remember for re-renders on return
+  opCardSub(p.phase === 'scan' ? 'Scanning both sides…' : `${fmtNum(p.done)} / ${fmtNum(p.total)} files`);
   applyCompareProgress(p);
 });
 
@@ -1757,8 +1825,10 @@ async function trashSelectedCompare() {
 async function quietRescan() {
   if (!S.root || S.scanning) return;
   S.scanning = true;
+  refreshBusyUI();
   const res = await api.scan(S.root);
   S.scanning = false;
+  refreshBusyUI();
   if (res && !res.error) {
     S.overview = await api.overview();
     updateRootCard(res);

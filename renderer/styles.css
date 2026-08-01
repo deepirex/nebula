@@ -132,6 +132,31 @@ body {
 }
 .sidebar-spacer { flex: 1; }
 
+/* While an operation runs, tabs that aren't hosting its live progress dim —
+   still clickable (never a navigation dead-end), just visually recessive. */
+.nav-item.busy-dim { opacity: 0.4; }
+
+.op-card {
+  border: 1px solid rgba(70, 215, 175, 0.28); border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, rgba(20,201,166,0.10), rgba(126,217,87,0.05));
+  padding: 12px 13px 11px; margin-bottom: 10px;
+  display: flex; flex-direction: column; gap: 5px;
+}
+.op-card-label {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; font-weight: 650; color: var(--text-primary);
+}
+.op-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px;
+  background: #14c9a6;
+  animation: op-pulse 1.4s ease-in-out infinite;
+}
+@keyframes op-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(20, 201, 166, 0.55); }
+  55% { box-shadow: 0 0 0 6px rgba(20, 201, 166, 0); }
+}
+.op-card-sub { font-size: 11px; color: var(--text-secondary); min-height: 14px; margin-bottom: 4px; }
+
 .root-card {
   border: 1px solid var(--border); border-radius: var(--radius-lg);
   background: var(--surface-1); padding: 13px 13px 11px;

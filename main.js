@@ -39,7 +39,8 @@ const CATEGORY_DEFS = [
   ['Video',         ['mp4','mov','avi','mkv','webm','m4v','flv','wmv','mpg','mpeg','mts','m2ts','3gp','hevc','vob']],
   ['Audio',         ['mp3','wav','aac','flac','m4a','ogg','oga','aiff','aif','wma','mid','midi','opus','m4b']],
   ['Documents',     ['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','md','rtf','odt','ods','odp','pages','numbers','key','epub','mobi','csv','tsv','ics','eml','msg']],
-  ['Code & Data',   ['js','mjs','cjs','ts','jsx','tsx','py','ipynb','java','c','cpp','cc','h','hpp','cs','go','rs','rb','php','swift','kt','kts','m','mm','html','htm','css','scss','less','json','xml','yml','yaml','toml','sh','zsh','bash','bat','ps1','sql','db','sqlite','log','lock','map','wasm','pkl','parquet','npy','pt','onnx','gguf','safetensors']],
+  ['Code & Data',   ['js','mjs','cjs','ts','jsx','tsx','py','ipynb','java','c','cpp','cc','h','hpp','cs','go','rs','rb','php','swift','kt','kts','m','mm','html','htm','css','scss','less','json','xml','yml','yaml','toml','sh','zsh','bash','bat','ps1','sql','db','sqlite','log','lock','map','wasm','pkl','parquet','npy']],
+  ['AI Models',     ['gguf','safetensors','pt','pth','ckpt','onnx','mlmodel','mlpackage','tflite','llamafile']],
   ['Archives',      ['zip','rar','7z','tar','gz','tgz','bz2','xz','zst','dmg','iso','img','pkg','deb','rpm','jar','war','apk','ipa','crx','xip']],
   ['Apps & System', ['app','exe','msi','dll','dylib','so','framework','sys','kext','bin','dat','plist','icns','ttf','otf','woff','woff2','tmp','cache','part','swp','ds_store']],
 ];
@@ -48,7 +49,11 @@ const EXT_TO_CATEGORY = new Map();
 for (const [cat, exts] of CATEGORY_DEFS) {
   for (const e of exts) EXT_TO_CATEGORY.set('.' + e, cat);
 }
-function categoryOf(ext) {
+// Ollama and Hugging Face store models as content-addressed blobs with no file
+// extension, so those stores are recognized by path instead.
+const MODEL_STORE_RE = /[\\/](?:\.ollama[\\/]models|huggingface[\\/]hub[\\/]models--)[\\/]/;
+function categoryOf(ext, filePath) {
+  if (filePath && MODEL_STORE_RE.test(filePath)) return 'AI Models';
   return EXT_TO_CATEGORY.get(ext) || 'Other';
 }
 
@@ -91,7 +96,7 @@ function fileInfo(f) {
     size: f.size,
     ext: f.ext,
     mtime: f.mtime,
-    category: categoryOf(f.ext),
+    category: categoryOf(f.ext, f.path),
   };
 }
 
@@ -293,7 +298,7 @@ function buildOverview() {
   const catAgg = new Map();
   const extAgg = new Map();
   for (const f of state.files) {
-    const cat = categoryOf(f.ext);
+    const cat = categoryOf(f.ext, f.path);
     let a = catAgg.get(cat);
     if (!a) catAgg.set(cat, a = { bytes: 0, count: 0 });
     a.bytes += f.size; a.count++;
@@ -467,7 +472,7 @@ async function findDuplicates() {
       wasted: size * (arr.length - 1),
       verified: !key.startsWith('S:'), // sampled-hash groups are high-confidence, not byte-verified
       ext: arr[0].ext,
-      category: categoryOf(arr[0].ext),
+      category: categoryOf(arr[0].ext, arr[0].path),
       files: arr
         .map(f => ({ path: f.path, name: f.name, dir: path.dirname(f.path), mtime: f.mtime }))
         .sort((a, b) => b.mtime - a.mtime),
@@ -518,6 +523,7 @@ function classifyForOrganize(name, ext, mtime, byYear) {
     case 'Audio': return { dest: y('Music'), reason: 'Audio' };
     case 'Documents': return { dest: y('Documents'), reason: 'Document' };
     case 'Code & Data': return { dest: 'Code & Data', reason: 'Data file' };
+    case 'AI Models': return { dest: 'AI Models', reason: 'AI model' };
     default: return null; // unknown or system files stay put
   }
 }
@@ -758,7 +764,7 @@ async function compareRoots(rootA, rootB) {
       wasted: size * (arr.length - 1),
       verified: !key.startsWith('S:'),
       ext: arr[0].f.ext,
-      category: categoryOf(arr[0].f.ext),
+      category: categoryOf(arr[0].f.ext, arr[0].f.path),
       files: arr
         .map(c => ({ path: c.f.path, name: c.f.name, dir: path.dirname(c.f.path), mtime: c.f.mtime, side: c.side }))
         .sort((x, y) => x.side.localeCompare(y.side) || y.mtime - x.mtime),
@@ -1149,7 +1155,7 @@ ipcMain.handle('dir:node', (_e, dirPath) => {
       name: c.name, path: c.path, size: c.size, isDir: c.isDir,
       fileCount: c.isDir ? c.fileCount : undefined,
       ext: c.ext, mtime: c.mtime,
-      category: c.isDir ? undefined : categoryOf(c.ext),
+      category: c.isDir ? undefined : categoryOf(c.ext, c.path),
     })),
     truncated: Math.max(0, node.children.length - LIMIT),
   };
@@ -1158,7 +1164,7 @@ ipcMain.handle('dir:node', (_e, dirPath) => {
 ipcMain.handle('files:largest', (_e, opts = {}) => {
   const { limit = 100, category = null, query = '' } = opts;
   let list = state.files;
-  if (category) list = list.filter(f => categoryOf(f.ext) === category);
+  if (category) list = list.filter(f => categoryOf(f.ext, f.path) === category);
   if (query) {
     const q = query.toLowerCase();
     list = list.filter(f => f.path.toLowerCase().includes(q));
