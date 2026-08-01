@@ -50,6 +50,12 @@ Grab the installer for your device from the
 | Mac — Intel | `…Mac-Intel.dmg` |
 | Windows 10/11 | `…Windows.exe` |
 
+> **First launch on macOS**: the app isn't notarized with Apple, so after you drag
+> it to Applications, macOS will claim it "is damaged and can't be opened". It
+> isn't — that's the quarantine flag on unsigned downloads. Clear it once:
+> `xattr -cr /Applications/Nebula.app`, then open Nebula normally.
+> On **Windows**, if SmartScreen appears: **More info** → **Run anyway**.
+
 ## Run it
 
 ```bash
