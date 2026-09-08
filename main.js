@@ -358,6 +358,38 @@ function hashRange(filePath, start, length) {
 const QUICK_BYTES = 131072;      // 128 KB head hash for first-pass grouping
 const FULL_HASH_LIMIT = 1.5e9;   // above this, sample instead of full read
 const SAMPLE_BYTES = 4 * 1024 * 1024;
+const HASH_BATCH = 1024;         // candidates hashed per round; keeps Promise.all bounded
+const MAX_GROUP_FILES = 1000;    // per duplicate set kept for the UI (totals stay exact)
+
+// Hash a candidate list in bounded rounds. A large volume can hold millions of
+// same-size files; fanning every one of them out into a single Promise.all
+// spikes memory (~KB per candidate) and eventually throws V8's
+// "Too many elements passed to Promise.all", killing the duplicate/compare
+// runs on big disks. Rounding keeps at most HASH_BATCH promises in flight.
+async function hashInRounds({ items, phase, total, sem, channel, cancelled, hashFile, remember }) {
+  let done = 0, lastSent = 0;
+  for (let i = 0; i < items.length; i += HASH_BATCH) {
+    if (cancelled()) return false;
+    const chunk = items.slice(i, i + HASH_BATCH);
+    await Promise.all(chunk.map(async it => {
+      if (cancelled()) return; // nothing new queued once a stop was requested
+      await sem.acquire();
+      try {
+        if (cancelled()) return; // cancelled while queued — hand the slot back
+        const h = await hashFile(it);
+        if (h != null) remember(it, h);
+      } catch { /* unreadable: drop from candidates */ }
+      finally { sem.release(); }
+      done++;
+      const now = Date.now();
+      if (now - lastSent > 100 || done === total) {
+        lastSent = now;
+        send(channel, { phase, done, total });
+      }
+    }));
+  }
+  return true;
+}
 
 async function sampledHash(filePath, size) {
   const h = crypto.createHash('sha1');
@@ -392,28 +424,17 @@ async function findDuplicates() {
   const quickList = sizeGroups.flat();
 
   const sem = new Semaphore(6);
-  let done = 0, lastSent = 0;
-  const tick = (phase, total) => {
-    done++;
-    const now = Date.now();
-    if (now - lastSent > 100 || done === total) {
-      lastSent = now;
-      send('dupes:progress', { phase, done, total });
-    }
-  };
 
   // Pass 2: hash the first 128 KB of every size-collision file.
   send('dupes:progress', { phase: 'quick', done: 0, total: quickList.length });
   const quickHashes = new Map(); // file path -> quick hash
-  await Promise.all(quickList.map(async f => {
-    if (state.dupeCancelled) return;
-    await sem.acquire();
-    try { quickHashes.set(f.path, await hashRange(f.path, 0, Math.min(f.size, QUICK_BYTES))); }
-    catch { /* unreadable: drop from candidates */ }
-    finally { sem.release(); }
-    tick('quick', quickList.length);
-  }));
-  if (state.dupeCancelled) { state.dupeRunning = false; return null; }
+  const quickDone = await hashInRounds({
+    items: quickList, phase: 'quick', total: quickList.length, sem,
+    channel: 'dupes:progress', cancelled: () => state.dupeCancelled,
+    hashFile: f => hashRange(f.path, 0, Math.min(f.size, QUICK_BYTES)),
+    remember: (f, h) => quickHashes.set(f.path, h),
+  });
+  if (!quickDone) { state.dupeRunning = false; return null; }
 
   const byQuick = new Map();
   for (const f of quickList) {
@@ -428,20 +449,18 @@ async function findDuplicates() {
   // Pass 3: confirm with a full-content hash (sampled for huge files).
   const fullList = [...byQuick.values()].filter(a => a.length > 1).flat()
     .filter(f => f.size > QUICK_BYTES); // small files: quick hash already covered every byte
-  done = 0; lastSent = 0;
   send('dupes:progress', { phase: 'full', done: 0, total: fullList.length });
   const fullHashes = new Map();
-  await Promise.all(fullList.map(async f => {
-    if (state.dupeCancelled) return;
-    await sem.acquire();
-    try {
-      if (f.size > FULL_HASH_LIMIT) fullHashes.set(f.path, 'S:' + await sampledHash(f.path, f.size));
-      else fullHashes.set(f.path, 'F:' + await hashRange(f.path, 0, null));
-    } catch { /* unreadable */ }
-    finally { sem.release(); }
-    tick('full', fullList.length);
-  }));
-  if (state.dupeCancelled) { state.dupeRunning = false; return null; }
+  const fullDone = await hashInRounds({
+    items: fullList, phase: 'full', total: fullList.length, sem,
+    channel: 'dupes:progress', cancelled: () => state.dupeCancelled,
+    hashFile: async f => {
+      if (f.size > FULL_HASH_LIMIT) return 'S:' + await sampledHash(f.path, f.size);
+      return 'F:' + await hashRange(f.path, 0, null);
+    },
+    remember: (f, h) => fullHashes.set(f.path, h),
+  });
+  if (!fullDone) { state.dupeRunning = false; return null; }
 
   const finalGroups = new Map();
   for (const arr of byQuick.values()) {
@@ -465,17 +484,24 @@ async function findDuplicates() {
   for (const [key, arr] of finalGroups.entries()) {
     if (arr.length < 2) continue;
     const size = arr[0].size;
+    // A set can contain hundreds of thousands of copies (a mirrored tree on a
+    // big volume). Keep the stats exact but only ship a bounded number of rows
+    // to the UI — otherwise the IPC payload and the renderer both blow up.
+    const rows = arr
+      .map(f => ({ path: f.path, name: f.name, dir: path.dirname(f.path), mtime: f.mtime }))
+      .sort((a, b) => b.mtime - a.mtime);
+    const count = rows.length;
+    if (rows.length > MAX_GROUP_FILES) rows.length = MAX_GROUP_FILES;
     groups.push({
       id: id++,
       size,
-      count: arr.length,
-      wasted: size * (arr.length - 1),
+      count,
+      wasted: size * (count - 1),
       verified: !key.startsWith('S:'), // sampled-hash groups are high-confidence, not byte-verified
       ext: arr[0].ext,
       category: categoryOf(arr[0].ext, arr[0].path),
-      files: arr
-        .map(f => ({ path: f.path, name: f.name, dir: path.dirname(f.path), mtime: f.mtime }))
-        .sort((a, b) => b.mtime - a.mtime),
+      files: rows,
+      more: count - rows.length, // copies beyond the rows kept, still counted above
     });
   }
   groups.sort((a, b) => b.wasted - a.wasted);
@@ -683,23 +709,15 @@ async function compareRoots(rootA, rootB) {
   const candidates = [...bySize.values()].filter(arr => arr.length > 1).flat();
 
   const sem = new Semaphore(6);
-  let done = 0, lastSent = 0;
-  const tick = (phase, total) => {
-    done++;
-    const now = Date.now();
-    if (now - lastSent > 100 || done === total) { lastSent = now; send('compare:progress', { phase, done, total }); }
-  };
 
   send('compare:progress', { phase: 'quick', done: 0, total: candidates.length });
-  await Promise.all(candidates.map(async c => {
-    if (cmp.cancelled) return;
-    await sem.acquire();
-    try { c.qh = await hashRange(c.f.path, 0, Math.min(c.f.size, QUICK_BYTES)); }
-    catch { /* unreadable */ }
-    finally { sem.release(); }
-    tick('quick', candidates.length);
-  }));
-  if (cmp.cancelled) { cmp.running = false; return null; }
+  const quickDone = await hashInRounds({
+    items: candidates, phase: 'quick', total: candidates.length, sem,
+    channel: 'compare:progress', cancelled: () => cmp.cancelled,
+    hashFile: c => hashRange(c.f.path, 0, Math.min(c.f.size, QUICK_BYTES)),
+    remember: (c, h) => { c.qh = h; },
+  });
+  if (!quickDone) { cmp.running = false; return null; }
 
   const byQuick = new Map();
   for (const c of candidates) {
@@ -714,18 +732,17 @@ async function compareRoots(rootA, rootB) {
     .filter(arr => arr.length > 1)
     .flat()
     .filter(c => c.f.size > QUICK_BYTES);
-  done = 0; lastSent = 0;
   send('compare:progress', { phase: 'full', done: 0, total: fullList.length });
-  await Promise.all(fullList.map(async c => {
-    if (cmp.cancelled) return;
-    await sem.acquire();
-    try {
-      c.fh = c.f.size > FULL_HASH_LIMIT ? 'S:' + await sampledHash(c.f.path, c.f.size) : 'F:' + await hashRange(c.f.path, 0, null);
-    } catch { /* unreadable */ }
-    finally { sem.release(); }
-    tick('full', fullList.length);
-  }));
-  if (cmp.cancelled) { cmp.running = false; return null; }
+  const fullDone = await hashInRounds({
+    items: fullList, phase: 'full', total: fullList.length, sem,
+    channel: 'compare:progress', cancelled: () => cmp.cancelled,
+    hashFile: async c => {
+      if (c.f.size > FULL_HASH_LIMIT) return 'S:' + await sampledHash(c.f.path, c.f.size);
+      return 'F:' + await hashRange(c.f.path, 0, null);
+    },
+    remember: (c, h) => { c.fh = h; },
+  });
+  if (!fullDone) { cmp.running = false; return null; }
 
   const finalMap = new Map();
   for (const arr of byQuick.values()) {
@@ -758,6 +775,17 @@ async function compareRoots(rootA, rootB) {
       overlapFilesB += countB;
     } else if (countA > 1) { scope = 'a'; withinWastedA += size * (countA - 1); }
     else { scope = 'b'; withinWastedB += size * (countB - 1); }
+    // Keep stats exact but bound the rows shipped to the UI. Split per side
+    // (newest first on each) so one side can't starve the other out of the
+    // visible list when a set has hundreds of thousands of copies.
+    const aKept = [], bKept = [];
+    for (const c of arr) (c.side === 'A' ? aKept : bKept).push(c);
+    aKept.sort((x, y) => y.f.mtime - x.f.mtime);
+    bKept.sort((x, y) => y.f.mtime - x.f.mtime);
+    aKept.length = Math.min(aKept.length, MAX_GROUP_FILES);
+    bKept.length = Math.min(bKept.length, MAX_GROUP_FILES);
+    const files = [...aKept, ...bKept]
+      .map(c => ({ path: c.f.path, name: c.f.name, dir: path.dirname(c.f.path), mtime: c.f.mtime, side: c.side }));
     groups.push({
       id: id++, size, countA, countB, count: arr.length, scope,
       bytes: size * arr.length,
@@ -765,9 +793,8 @@ async function compareRoots(rootA, rootB) {
       verified: !key.startsWith('S:'),
       ext: arr[0].f.ext,
       category: categoryOf(arr[0].f.ext, arr[0].f.path),
-      files: arr
-        .map(c => ({ path: c.f.path, name: c.f.name, dir: path.dirname(c.f.path), mtime: c.f.mtime, side: c.side }))
-        .sort((x, y) => x.side.localeCompare(y.side) || y.mtime - x.mtime),
+      files,
+      more: arr.length - files.length,
     });
   }
   groups.sort((x, y) => y.bytes - x.bytes);
@@ -1203,10 +1230,21 @@ ipcMain.handle('files:trash', async (_e, paths) => {
     const gone = new Set(trashed);
     state.files = state.files.filter(f => !gone.has(f.path));
     if (state.duplicates) {
-      state.duplicates.groups = state.duplicates.groups
-        .map(g => ({ ...g, files: g.files.filter(f => !gone.has(f.path)) }))
-        .map(g => ({ ...g, count: g.files.length, wasted: g.size * Math.max(0, g.files.length - 1) }))
-        .filter(g => g.files.length > 1);
+      // Row lists per group are capped (MAX_GROUP_FILES), while count/wasted
+      // are exact totals — so update totals from what left the set, not from
+      // how many rows remain.
+      const kept = [];
+      for (const g of state.duplicates.groups) {
+        const before = g.files.length;
+        g.files = g.files.filter(f => !gone.has(f.path));
+        if (before - g.files.length > 0) {
+          g.count = Math.max(g.files.length, g.count - (before - g.files.length));
+          g.more = Math.max(0, g.count - g.files.length);
+          g.wasted = g.size * Math.max(0, g.count - 1);
+        }
+        if (g.count > 1) kept.push(g);
+      }
+      state.duplicates.groups = kept;
       state.duplicates.groupCount = state.duplicates.groups.length;
       state.duplicates.shown = state.duplicates.groups.length;
       state.duplicates.totalWasted = state.duplicates.groups.reduce((s, g) => s + g.wasted, 0);

@@ -1027,12 +1027,17 @@ const GROUP_ROW_CAP = 8;
 
 function dupeGroupHtml(g) {
   const names = new Set(g.files.map(f => f.name.toLowerCase()));
-  const title = names.size === 1
-    ? esc(g.files[0].name)
-    : `${esc(g.files[0].name)} <span style="color:var(--text-muted);font-weight:500">+ ${fmtNum(names.size - 1)} other name${names.size > 2 ? 's' : ''}, identical content</span>`;
+  const title = g.files.length
+    ? (names.size === 1
+      ? esc(g.files[0].name)
+      : `${esc(g.files[0].name)} <span style="color:var(--text-muted);font-weight:500">+ ${fmtNum(names.size - 1)} other name${names.size > 2 ? 's' : ''}, identical content</span>`)
+    : `${fmtNum(g.count)} identical copies`;
   const expanded = S.dupeExpanded.has(g.id);
   const rows = expanded ? g.files : g.files.slice(0, GROUP_ROW_CAP);
   const hiddenCount = g.files.length - rows.length;
+  const cappedNote = g.more
+    ? `<div class="dupe-note">+ ${fmtNum(g.more)} more identical copies not listed — re-run analysis to manage them</div>`
+    : '';
   return `
     <div class="panel dupe-group">
       <div class="dupe-group-head">
@@ -1046,15 +1051,17 @@ function dupeGroupHtml(g) {
         <div class="dupe-file">
           <input type="checkbox" data-path="${esc(f.path)}" ${S.dupeSelection.has(f.path) ? 'checked' : ''}>
           <div class="dupe-file-name">${esc(f.name)}</div>
-          ${i === 0 ? '<span class="tag-newest">newest</span>' : ''}
+          ${i === 0 && g.files.length > 1 ? '<span class="tag-newest">newest</span>' : ''}
           <div class="dupe-file-path" data-path="${esc(f.path)}" title="Reveal">${esc(f.dir)}</div>
           <div class="dupe-file-date">${fmtDate(f.mtime)}</div>
         </div>`).join('')}
+      ${rows.length === 0 && g.files.length === 0 ? '<div class="dupe-note">The listed copies were removed — re-run analysis to see the remaining ones.</div>' : ''}
       ${hiddenCount > 0
-        ? `<div class="dupe-expand"><button class="btn btn-ghost btn-small" data-expand="${g.id}">Show all ${fmtNum(g.files.length)} copies</button></div>`
+        ? `<div class="dupe-expand"><button class="btn btn-ghost btn-small" data-expand="${g.id}">Show all ${fmtNum(g.files.length)} listed copies</button></div>`
         : (expanded && g.files.length > GROUP_ROW_CAP
           ? `<div class="dupe-expand"><button class="btn btn-ghost btn-small" data-collapse="${g.id}">Collapse</button></div>`
           : '')}
+      ${cappedNote}
     </div>`;
 }
 
@@ -1156,11 +1163,21 @@ async function trashSelectedDupes() {
   const res = await api.trash(paths);
   const gone = new Set(res.trashed);
 
-  // Mirror the main-process index update in the renderer's copy.
-  S.dupes.groups = S.dupes.groups
-    .map(g => ({ ...g, files: g.files.filter(f => !gone.has(f.path)) }))
-    .map(g => ({ ...g, count: g.files.length, wasted: g.size * Math.max(0, g.files.length - 1) }))
-    .filter(g => g.files.length > 1);
+  // Mirror the main-process index update in the renderer's copy. Rows per group
+  // are capped while count/wasted are exact totals, so adjust totals by what
+  // left each set (main.js MAX_GROUP_FILES) rather than from remaining rows.
+  const kept = [];
+  for (const g of S.dupes.groups) {
+    const before = g.files.length;
+    g.files = g.files.filter(f => !gone.has(f.path));
+    if (before - g.files.length > 0) {
+      g.count = Math.max(g.files.length, g.count - (before - g.files.length));
+      g.more = Math.max(0, g.count - g.files.length);
+      g.wasted = g.size * Math.max(0, g.count - 1);
+    }
+    if (g.count > 1) kept.push(g);
+  }
+  S.dupes.groups = kept;
   S.dupes.groupCount = S.dupes.groups.length;
   S.dupes.shown = S.dupes.groups.length;
   S.dupes.totalWasted = S.dupes.groups.reduce((s, g) => s + g.wasted, 0);
@@ -1659,11 +1676,14 @@ function cmpGroupHtml(g) {
   const expanded = C.expanded.has(g.id);
   const rows = expanded ? g.files : g.files.slice(0, 8);
   const hiddenCount = g.files.length - rows.length;
+  const cappedNote = g.more
+    ? `<div class="dupe-note">+ ${fmtNum(g.more)} more copies not listed — re-run the comparison to manage them</div>`
+    : '';
   return `
     <div class="panel dupe-group">
       <div class="dupe-group-head">
         <div class="file-chip" style="background:${catColor(g.category)}">${esc(extLabel(g.ext))}</div>
-        <div class="dupe-group-title">${esc(g.files[0].name)}</div>
+        <div class="dupe-group-title">${g.files.length ? esc(g.files[0].name) : `${fmtNum(g.count)} identical copies`}</div>
         <span class="badge ${g.verified ? 'badge-verified' : 'badge-sampled'}">${g.verified ? 'content verified' : 'sampled match'}</span>
         <div class="dupe-group-meta">${g.scope === 'cross'
           ? `${fmtNum(g.countA)} on A · ${fmtNum(g.countB)} on B · ${fmtBytes(g.size)} each`
@@ -1678,7 +1698,9 @@ function cmpGroupHtml(g) {
           <div class="dupe-file-path" data-path="${esc(f.path)}" title="Reveal">${esc(f.dir)}</div>
           <div class="dupe-file-date">${fmtDate(f.mtime)}</div>
         </div>`).join('')}
-      ${hiddenCount > 0 ? `<div class="dupe-expand"><button class="btn btn-ghost btn-small" data-expand="${g.id}">Show all ${fmtNum(g.files.length)} copies</button></div>` : ''}
+      ${rows.length === 0 && g.files.length === 0 ? '<div class="dupe-note">The listed copies were removed — re-run the comparison to see the remaining ones.</div>' : ''}
+      ${hiddenCount > 0 ? `<div class="dupe-expand"><button class="btn btn-ghost btn-small" data-expand="${g.id}">Show all ${fmtNum(g.files.length)} listed copies</button></div>` : ''}
+      ${cappedNote}
     </div>`;
 }
 
@@ -1791,15 +1813,30 @@ async function trashSelectedCompare() {
   const res = await api.trash(paths);
   const gone = new Set(res.trashed);
   const r = C.results;
-  r.groups = r.groups
-    .map(g => {
-      const files = g.files.filter(f => !gone.has(f.path));
-      const countA = files.filter(f => f.side === 'A').length;
-      const countB = files.length - countA;
-      const scope = countA && countB ? 'cross' : countA > 1 ? 'a' : countB > 1 ? 'b' : 'dead';
-      return { ...g, files, countA, countB, scope, count: files.length, bytes: g.size * files.length, wasted: g.size * Math.max(0, files.length - 1) };
-    })
-    .filter(g => g.scope !== 'dead');
+  // Files per group are capped (main.js MAX_GROUP_FILES) while countA/countB
+  // are exact totals — adjust the totals by what left each side, then re-derive
+  // the scope from the remaining true counts instead of from visible rows.
+  const keptG = [];
+  for (const g of r.groups) {
+    const beforeA = g.files.filter(f => f.side === 'A').length;
+    const beforeB = g.files.length - beforeA;
+    g.files = g.files.filter(f => !gone.has(f.path));
+    const afterA = g.files.filter(f => f.side === 'A').length;
+    const afterB = g.files.length - afterA;
+    const removedA = beforeA - afterA;
+    const removedB = beforeB - afterB;
+    if (removedA || removedB) {
+      g.countA = Math.max(afterA, g.countA - removedA);
+      g.countB = Math.max(afterB, g.countB - removedB);
+      g.count = g.countA + g.countB;
+      g.more = Math.max(0, g.count - g.files.length);
+    }
+    g.scope = g.countA && g.countB ? 'cross' : g.countA > 1 ? 'a' : g.countB > 1 ? 'b' : 'dead';
+    g.bytes = g.size * g.count;
+    g.wasted = g.size * Math.max(0, g.count - 1);
+    if (g.scope !== 'dead') keptG.push(g);
+  }
+  r.groups = keptG;
   const crossGroups = r.groups.filter(g => g.scope === 'cross');
   for (const side of ['a', 'b']) {
     const isA = side === 'a';

@@ -483,6 +483,7 @@ body {
 .select:focus { border-color: rgba(120, 150, 255, 0.5); }
 .select option { background: #171b24; color: var(--text-primary); }
 .dupe-expand { padding: 6px 8px 2px; }
+.dupe-note { padding: 6px 8px 2px; font-size: 11px; color: var(--text-muted); font-style: italic; }
 
 .dupe-file { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: var(--radius-sm); }
 .dupe-file:hover { background: var(--surface-2); }
