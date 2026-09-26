@@ -147,8 +147,12 @@ async function runScan(root) {
     const fileEnts = [];
     for (const ent of entries) {
       if (ent.isSymbolicLink()) continue; // never follow links: avoids cycles and double-counting
-      if (ent.isDirectory()) dirEnts.push(ent);
-      else if (ent.isFile()) fileEnts.push(ent);
+      if (ent.isDirectory()) {
+        // Never index our own Trash folder — removed copies must not reappear as
+        // duplicates on the next run.
+        if (isNebulaTrashDir(path.join(dirPath, ent.name))) continue;
+        dirEnts.push(ent);
+      } else if (ent.isFile()) fileEnts.push(ent);
     }
 
     for (let i = 0; i < fileEnts.length; i += 64) {
@@ -864,8 +868,10 @@ async function collectFiles(root, sideLabel) {
     const dirEnts = [], fileEnts = [];
     for (const ent of entries) {
       if (ent.isSymbolicLink()) continue;
-      if (ent.isDirectory()) dirEnts.push(ent);
-      else if (ent.isFile()) fileEnts.push(ent);
+      if (ent.isDirectory()) {
+        if (isNebulaTrashDir(path.join(dirPath, ent.name))) continue; // skip Nebula's own Trash
+        dirEnts.push(ent);
+      } else if (ent.isFile()) fileEnts.push(ent);
     }
     for (let i = 0; i < fileEnts.length; i += 64) {
       if (cmp.cancelled) return;
@@ -1442,13 +1448,27 @@ ipcMain.handle('dupes:load', async () => {
 
 // ------------------------------------------------------------- trash helpers
 //
-// "Move to Trash" has to be honest on removable volumes: files on an external
-// drive go to that drive's own Trash (<volume>/.Trashes/<uid>), which Finder
-// often does not show, and the space is only reclaimed when that drive's Trash
-// is emptied. So every move is verified, the destination is reported back, and
-// emptying a drive's Trash is an explicit, separate action.
+// Where removed copies go depends on the volume:
+//   • the startup disk keeps the macOS Trash (~/.Trash), which Finder shows
+//     properly — nothing to fix there;
+//   • every OTHER volume (external/removable drives) gets a "Nebula Trash"
+//     folder on that drive itself. Those drives' own .Trashes/<uid> folders are
+//     invisible to Finder and unreadable to apps without Full Disk Access, so
+//     files moved there look like they vanished, and the space stays used until
+//     something else empties them. A drive-local folder stays visible in Finder,
+//     is restorable and emptyable from inside Nebula, and actually frees space.
+// Trash directories Nebula owns are never scanned, so removed copies cannot
+// reappear as duplicates.
+
+const NEBULA_TRASH_NAME = 'Nebula Trash';
+const NEBULA_TRASH_MARKER = 'nebula-trash.json';
+const SESSION_MANIFEST = 'manifest.json';
+
+// Test seam: lets a harness describe mounts that don't exist on the host.
+let volumeResolver = null;
 
 function volumeOf(p) {
+  if (volumeResolver) return volumeResolver(p);
   if (process.platform === 'win32') {
     const m = /^([A-Za-z]:\\)/.exec(p);
     return m ? m[1] : null;
@@ -1458,6 +1478,12 @@ function volumeOf(p) {
   return path.sep;
 }
 
+// Should this volume use Nebula's own Trash folder instead of the OS Trash?
+function useNebulaTrash(volume) {
+  if (!volume || process.platform === 'win32') return false; // Windows' Recycle Bin is per-volume and visible
+  return volume !== path.sep;
+}
+
 function volumeTrashDir(volume) {
   if (!volume) return null;
   if (process.platform === 'win32') return null; // Recycle Bin has no browsable path
@@ -1465,6 +1491,199 @@ function volumeTrashDir(volume) {
   // its own .Trashes/<uid> (which is exactly why files "vanish" on external drives).
   if (volume === path.sep) return path.join(os.homedir(), '.Trash');
   return path.join(volume, '.Trashes', String(process.getuid()));
+}
+
+function nebulaTrashRoot(volume) {
+  return path.join(volume, NEBULA_TRASH_NAME);
+}
+
+const isInside = (parent, p) => p === parent || (typeof p === 'string' && p.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep));
+
+function isNebulaTrashDir(dir) {
+  if (path.basename(dir) !== NEBULA_TRASH_NAME) return false;
+  try { return fs.existsSync(path.join(dir, NEBULA_TRASH_MARKER)); } catch { return false; }
+}
+
+function sessionStamp(at = Date.now()) {
+  return new Date(at).toISOString().replace(/[:.]/g, '-').slice(0, 19);
+}
+
+async function ensureNebulaTrashRoot(volume) {
+  const root = nebulaTrashRoot(volume);
+  await fsp.mkdir(root, { recursive: true });
+  const marker = path.join(root, NEBULA_TRASH_MARKER);
+  if (!fs.existsSync(marker)) {
+    await fsp.writeFile(marker, JSON.stringify({
+      v: 1,
+      app: 'Nebula',
+      kind: 'nebula-trash',
+      note: 'Copies removed by Nebula are kept here so they stay visible in Finder and restorable. Nebula never scans this folder.',
+    }));
+  }
+  return root;
+}
+
+const manifestPath = sessionDir => path.join(sessionDir, SESSION_MANIFEST);
+
+// Move files into <volume>/Nebula Trash/<session>/, preserving each file's path
+// relative to the volume so a restore is exact.
+async function moveIntoNebulaTrash(paths, volume, { at = Date.now(), onFile } = {}) {
+  const root = await ensureNebulaTrashRoot(volume);
+  const sessionDir = path.join(root, sessionStamp(at));
+  await fsp.mkdir(sessionDir, { recursive: true });
+
+  const moved = [], failed = [], entries = [];
+  for (const p of paths) {
+    try {
+      const rel = path.relative(volume, p);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('not inside this volume');
+      const dest = path.join(sessionDir, rel);
+      let st = null;
+      try { st = await fsp.stat(p); } catch { /* size is only for the report */ }
+      await fsp.mkdir(path.dirname(dest), { recursive: true });
+      await fsp.rename(p, dest); // same volume: never copies, so it cannot fail for space
+      if (fs.existsSync(p)) throw new Error('file is still on disk after the move');
+      moved.push(p);
+      entries.push({ from: p, rel, size: st ? st.size : 0, mtime: st ? Math.round(st.mtimeMs) : 0 });
+    } catch (err) {
+      failed.push({ path: p, error: String((err && err.message) || err) });
+    }
+    if (onFile) onFile();
+  }
+  await fsp.writeFile(manifestPath(sessionDir), JSON.stringify({ v: 1, kind: 'nebula-trash-session', volume, at, entries }, null, 1));
+  return { moved, failed, entries, sessionDir, root, bytes: entries.reduce((s, e) => s + e.size, 0) };
+}
+
+// Every Nebula Trash session on a volume, with counts and sizes read from the
+// manifests (walking is only a fallback for folders without one).
+async function nebulaTrashSessions(volume) {
+  const root = nebulaTrashRoot(volume);
+  let names = [];
+  try { names = await fsp.readdir(root); } catch { return { volume, root, sessions: [], files: 0, bytes: 0 }; }
+  const sessions = [];
+  for (const name of names) {
+    if (name === NEBULA_TRASH_MARKER) continue;
+    const dir = path.join(root, name);
+    let st;
+    try { st = await fsp.stat(dir); } catch { continue; }
+    if (!st.isDirectory()) continue;
+    let files = 0, bytes = 0, entries = null;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(manifestPath(dir), 'utf8'));
+      if (Array.isArray(parsed.entries)) { entries = parsed.entries; files = entries.length; bytes = entries.reduce((s, e) => s + (e.size || 0), 0); }
+    } catch { /* fall through to a walk */ }
+    if (!entries) {
+      const walked = await dirStats(dir);
+      files = walked.items; bytes = walked.bytes;
+    }
+    sessions.push({ id: name, dir, at: st.mtimeMs, files, bytes });
+  }
+  sessions.sort((a, b) => b.at - a.at);
+  return {
+    volume, root, sessions,
+    files: sessions.reduce((s, x) => s + x.files, 0),
+    bytes: sessions.reduce((s, x) => s + x.bytes, 0),
+  };
+}
+
+// Put files back exactly where they came from. A path that is occupied again is
+// restored under a collision-safe name rather than overwriting anything.
+async function restoreNebulaTrash(volume, sessionId) {
+  const root = nebulaTrashRoot(volume);
+  const all = await nebulaTrashSessions(volume);
+  const dirs = sessionId ? [path.join(root, sessionId)] : all.sessions.map(s => s.dir);
+  const restored = [], failed = [];
+  for (const dir of dirs) {
+    if (!isInside(root, dir) || dir === root) { failed.push({ path: dir, error: 'outside the Nebula Trash folder' }); continue; }
+    let entries = null;
+    try { entries = JSON.parse(await fsp.readFile(manifestPath(dir), 'utf8')).entries; } catch { /* handled below */ }
+    if (!Array.isArray(entries)) { failed.push({ path: dir, error: 'no restore manifest for this session' }); continue; }
+    for (const e of entries) {
+      try {
+        const from = path.join(dir, e.rel);
+        if (!fs.existsSync(from)) { failed.push({ path: e.from, error: 'not in the Trash folder any more' }); continue; }
+        const dest = fs.existsSync(e.from) ? uniqueDest(e.from) : e.from;
+        await fsp.mkdir(path.dirname(dest), { recursive: true });
+        await fsp.rename(from, dest);
+        restored.push(dest);
+      } catch (err) {
+        failed.push({ path: e.from, error: String((err && err.message) || err) });
+      }
+    }
+    await fsp.rm(manifestPath(dir), { force: true }).catch(() => {});
+    await pruneEmptyDirs(dir);
+  }
+  return { restored, failed };
+}
+
+// Recursively drop directories that are empty (used after a restore so no
+// half-empty session folders are left behind).
+async function pruneEmptyDirs(dir) {
+  let entries;
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const ent of entries) {
+    if (ent.isDirectory()) await pruneEmptyDirs(path.join(dir, ent.name));
+  }
+  try { await fsp.rmdir(dir); } catch { /* not empty — keep */ }
+}
+
+// Permanently delete a session (or every session) — this is what finally frees
+// the space, and it is only ever reached from an explicit, confirmed action.
+async function emptyNebulaTrash(volume, sessionId) {
+  const root = nebulaTrashRoot(volume);
+  const all = await nebulaTrashSessions(volume);
+  const dirs = sessionId ? [path.join(root, sessionId)] : all.sessions.map(s => s.dir);
+  let removed = 0, bytes_freed = 0;
+  const failed = [];
+  for (const dir of dirs) {
+    if (!isInside(root, dir) || dir === root) { failed.push({ path: dir, error: 'outside the Nebula Trash folder' }); continue; }
+    // Count what the user actually removed (the manifest), not our own metadata
+    // file — "removed 2 files" must never include manifest.json.
+    let files = 0, bytes = 0, entries = null;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(manifestPath(dir), 'utf8'));
+      if (Array.isArray(parsed.entries)) entries = parsed.entries;
+    } catch { /* fall back to a walk below */ }
+    if (entries) {
+      files = entries.length;
+      bytes = entries.reduce((s, e) => s + (e.size || 0), 0);
+    } else {
+      const stats = await dirStats(dir);
+      files = stats.items; bytes = stats.bytes;
+    }
+    try {
+      await fsp.rm(dir, { recursive: true, force: true });
+      removed += files;
+      bytes_freed += bytes;
+    } catch (err) {
+      failed.push({ path: dir, error: String((err && err.message) || err) });
+    }
+  }
+  // With nothing left, take the empty folder (and its marker) with it so the
+  // drive stays clean.
+  const leftover = await nebulaTrashSessions(volume);
+  if (!leftover.sessions.length) {
+    await fsp.rm(path.join(root, NEBULA_TRASH_MARKER), { force: true }).catch(() => {});
+    await fsp.rmdir(root).catch(() => { /* still in use — keep it */ });
+  }
+  return { removed, bytes: bytes_freed, failed, root };
+}
+
+async function trashInfo(volume) {
+  const mode = useNebulaTrash(volume) ? 'nebula' : 'os';
+  if (mode === 'nebula') {
+    const info = await nebulaTrashSessions(volume);
+    return { volume, mode, dir: info.root, sessions: info.sessions, files: info.files, bytes: info.bytes };
+  }
+  const dir = volumeTrashDir(volume);
+  let files = 0, bytes = 0, readable = true, error = null;
+  const st = dir ? await fsp.stat(dir).catch(() => null) : null;
+  if (dir && st) {
+    const stats = await dirStats(dir);
+    files = stats.items; bytes = stats.bytes;
+    if (stats.unreadable && !stats.items) { readable = false; error = trashUnreadableMessage(dir); }
+  }
+  return { volume, mode, dir, sessions: [], files, bytes, readable, error };
 }
 
 // A volume is actionable if the user opened a folder on it (or below it).
@@ -1515,47 +1734,80 @@ const withTimeout = (promise, ms, message) => Promise.race([
 async function trashFiles(paths) {
   const trashed = [];
   const failed = [];
-  const volumes = new Map(); // volume -> { trashed, bytes }
-  if (!Array.isArray(paths)) return { trashed, failed, volumes: [] };
+  const destByKey = new Map();
+  if (!Array.isArray(paths)) return { trashed, failed, destinations: [] };
   state.trashCancelled = false;
 
+  const total = paths.length;
   let done = 0;
   let lastSent = 0;
-  for (const p of paths) {
-    if (state.trashCancelled) { failed.push({ path: p, error: 'cancelled' }); continue; }
-    if (!isAuthorized(p)) { failed.push({ path: p, error: 'outside authorized folders' }); continue; }
-    let size = 0;
-    try { size = (await fsp.stat(p)).size; } catch { /* size is only for the report */ }
-    try {
-      // Bound each move: a stalled filesystem must not freeze the whole run.
-      await withTimeout(shell.trashItem(p), 30000, 'timed out moving to Trash');
-      // Verify against the filesystem — never trust the call alone, or the UI
-      // (and the index) would claim a delete that never happened.
-      if (fs.existsSync(p)) throw new Error('file is still on disk after the Trash move was reported as successful');
-      trashed.push(p);
-      removeFromIndex(p);
-      const vol = volumeOf(p);
-      const v = volumes.get(vol) || { volume: vol, trashDir: volumeTrashDir(vol), files: 0, bytes: 0 };
-      v.files++; v.bytes += size;
-      volumes.set(vol, v);
-    } catch (err) {
-      failed.push({ path: p, error: String((err && err.message) || err) });
-    }
+  const report = () => {
     done++;
     const now = Date.now();
-    if (now - lastSent > 100 || done === paths.length) {
+    if (now - lastSent > 100 || done === total) {
       lastSent = now;
-      send('trash:progress', { done, total: paths.length, trashed: trashed.length, failed: failed.length });
+      send('trash:progress', { done, total, trashed: trashed.length, failed: failed.length });
+    }
+  };
+
+  // Group by destination volume: the startup disk keeps the OS Trash, every
+  // other volume gets its own Nebula Trash folder.
+  const byVolume = new Map();
+  for (const p of paths) {
+    if (!isAuthorized(p)) { failed.push({ path: p, error: 'outside authorized folders' }); report(); continue; }
+    const vol = volumeOf(p);
+    const list = byVolume.get(vol);
+    if (list) list.push(p); else byVolume.set(vol, [p]);
+  }
+
+  for (const [vol, list] of byVolume) {
+    if (state.trashCancelled) {
+      for (const p of list) { failed.push({ path: p, error: 'cancelled' }); report(); }
+      continue;
+    }
+    if (useNebulaTrash(vol)) {
+      const res = await moveIntoNebulaTrash(list, vol, { onFile: report });
+      trashed.push(...res.moved);
+      failed.push(...res.failed);
+      for (const p of res.moved) removeFromIndex(p);
+      if (res.moved.length) {
+        destByKey.set(`${vol}|nebula`, {
+          volume: vol, mode: 'nebula', session: res.sessionDir, dir: res.sessionDir, root: res.root,
+          files: res.moved.length, bytes: res.bytes,
+        });
+      }
+      continue;
+    }
+    // OS Trash: bound each move, then verify it against the filesystem.
+    let volEntry = null;
+    for (const p of list) {
+      if (state.trashCancelled) { failed.push({ path: p, error: 'cancelled' }); report(); continue; }
+      let size = 0;
+      try { size = (await fsp.stat(p)).size; } catch { /* size is only for the report */ }
+      try {
+        await withTimeout(shell.trashItem(p), 30000, 'timed out moving to Trash');
+        if (fs.existsSync(p)) throw new Error('file is still on disk after the Trash move was reported as successful');
+        trashed.push(p);
+        removeFromIndex(p);
+        if (!volEntry) {
+          volEntry = { volume: vol, mode: 'os', dir: volumeTrashDir(vol), files: 0, bytes: 0 };
+          destByKey.set(`${vol}|os`, volEntry);
+        }
+        volEntry.files++; volEntry.bytes += size;
+      } catch (err) {
+        failed.push({ path: p, error: String((err && err.message) || err) });
+      }
+      report();
     }
   }
-  return { trashed, failed, volumes: [...volumes.values()] };
+  return { trashed, failed, destinations: [...destByKey.values()] };
 }
 
 // Move files to the Trash and fold the outcome into the session state. Only
 // files verified as gone leave the index, so a failed move can never make the
 // UI (or the saved analysis) claim a cleanup that did not happen.
 async function trashAndUpdate(paths) {
-  const { trashed, failed, volumes } = await trashFiles(paths);
+  const { trashed, failed, destinations } = await trashFiles(paths);
   if (trashed.length) {
     const gone = new Set(trashed);
     state.files = state.files.filter(f => !gone.has(f.path));
@@ -1593,15 +1845,50 @@ async function trashAndUpdate(paths) {
     scheduleSaveIndex();
     scheduleSaveDupes(); // the analysis itself changed (groups lost copies)
   }
-  return { trashed, failed, volumes };
+  return { trashed, failed, destinations };
 }
 
 ipcMain.handle('files:trash', (_e, paths) => trashAndUpdate(paths));
 
 ipcMain.handle('trash:cancel', () => { state.trashCancelled = true; return true; });
 
-// How much is sitting in a volume's own Trash (external drives keep their own),
-// and whether we are allowed to look at it.
+// What is waiting in removed-copies storage for a volume, and where it lives:
+// Nebula's own folder on external drives, the OS Trash on the startup disk.
+ipcMain.handle('trash:info', async (_e, volume) => {
+  try {
+    if (!isAuthorizedVolume(volume)) return { error: 'Open a folder on that volume first.' };
+    return await trashInfo(volume);
+  } catch (err) {
+    return { volume, error: String((err && err.message) || err) };
+  }
+});
+
+// Put removed copies back exactly where they came from.
+ipcMain.handle('trash:restore', async (_e, volume, sessionId) => {
+  try {
+    if (!isAuthorizedVolume(volume)) return { error: 'Open a folder on that volume first.' };
+    if (!useNebulaTrash(volume)) return { error: 'This volume uses the system Trash — restore from Finder.' };
+    const res = await restoreNebulaTrash(volume, sessionId || null);
+    return { restored: res.restored.length, paths: res.restored, failed: res.failed };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
+// Permanently delete removed copies held in Nebula's folder — the step that
+// actually frees the space. Explicitly requested and confirmed in the UI.
+ipcMain.handle('trash:empty', async (_e, volume, sessionId) => {
+  try {
+    if (!isAuthorizedVolume(volume)) return { error: 'Open a folder on that volume first.' };
+    if (!useNebulaTrash(volume)) return { error: 'This volume uses the system Trash — empty it from Finder.' };
+    return await emptyNebulaTrash(volume, sessionId || null);
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
+// How much is sitting in a volume's own system Trash (external drives keep their
+// own), and whether we are allowed to look at it.
 ipcMain.handle('trash:volumeInfo', async (_e, volume) => {
   try {
     if (!isAuthorizedVolume(volume)) return { error: 'Open a folder on that volume first.' };
@@ -1704,4 +1991,8 @@ module.exports.__test = {
   buildOrganizePlan, applyOrganize, undoOrganize,
   saveDupesState, loadDupesState, loadHashCache, dupesInfo, trashFiles, trashAndUpdate, volumeOf,
   volumeTrashDir, dirStats, cachedHash, rememberHash,
+  // Nebula Trash (drive-local removed-copies folder)
+  nebulaTrashRoot, moveIntoNebulaTrash, nebulaTrashSessions, restoreNebulaTrash, emptyNebulaTrash,
+  trashInfo, useNebulaTrash, isNebulaTrashDir, NEBULA_TRASH_NAME, NEBULA_TRASH_MARKER,
+  setVolumeResolver: fn => { volumeResolver = fn; },
 };

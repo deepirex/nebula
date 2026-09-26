@@ -133,6 +133,60 @@ app.whenReady().then(async () => {
       JSON.stringify(stats));
     fs.chmodSync(locked, 0o755);
 
+    // ---- 8. drive-local Nebula Trash (non-boot volumes)
+    // Stand in for an external drive with a volume resolver.
+    const volDir = path.join(work, 'FAKEVOL');
+    fs.mkdirSync(path.join(volDir, 'photos', 'trip'), { recursive: true });
+    fs.mkdirSync(path.join(volDir, 'music'), { recursive: true });
+    const f1 = path.join(volDir, 'photos', 'trip', 'a.jpg');
+    const f2 = path.join(volDir, 'music', 'b.mp3');
+    fs.writeFileSync(f1, Buffer.alloc(1000, 1));
+    fs.writeFileSync(f2, Buffer.alloc(2000, 2));
+    t.setVolumeResolver(p => (p.startsWith(volDir) ? volDir : t.volumeOf(p)));
+
+    check('external volume uses the Nebula Trash mode', t.useNebulaTrash(volDir) === true);
+    const volScan = await t.runScan(volDir); // opening a folder authorizes it, as in the app
+    check('fake volume scans normally', volScan.fileCount === 2, `fileCount=${volScan.fileCount}`);
+
+    const routed = await t.trashAndUpdate([f1, f2]);
+    check('files move into the drive-local folder', routed.trashed.length === 2 && routed.failed.length === 0 &&
+      !fs.existsSync(f1) && !fs.existsSync(f2), JSON.stringify(routed.failed));
+    const dest = (routed.destinations || [])[0] || {};
+    check('destination reports Nebula Trash mode', dest.mode === 'nebula' && dest.dir && dest.dir.startsWith(t.nebulaTrashRoot(volDir)),
+      JSON.stringify(dest));
+    check('relative layout is preserved inside the Trash folder',
+      fs.existsSync(path.join(dest.dir, 'photos', 'trip', 'a.jpg')) && fs.existsSync(path.join(dest.dir, 'music', 'b.mp3')));
+
+    // the Trash folder must never be scanned (removed copies cannot reappear as duplicates)
+    fs.writeFileSync(path.join(volDir, 'photos', 'trip', 'a-copy.jpg'), Buffer.alloc(1000, 1));
+    await t.runScan(volDir);
+    const scanned = t.state.files.map(f => f.path);
+    check('Nebula Trash is excluded from scans, new files are not',
+      !scanned.some(p => p.includes(t.NEBULA_TRASH_NAME)) && scanned.some(p => p.endsWith('a-copy.jpg')),
+      `indexed=${scanned.length}`);
+
+    // sessions + sizes are reported for the UI
+    let info = await t.trashInfo(volDir);
+    check('trash info lists the session with size', info.mode === 'nebula' && info.files === 2 && info.bytes === 3000 && info.sessions.length === 1,
+      JSON.stringify({ mode: info.mode, files: info.files, bytes: info.bytes, sessions: info.sessions.length }));
+
+    // restore puts them back exactly, without overwriting an occupied path
+    fs.writeFileSync(f1, Buffer.alloc(555, 9)); // something new now lives at the original path
+    const rest = await t.restoreNebulaTrash(volDir, null);
+    check('restore returns files to their original folders', rest.restored.length === 2 && fs.existsSync(f2), JSON.stringify(rest.failed));
+    check('restore never overwrites an occupied path', fs.readFileSync(f1).length === 555 && rest.restored.some(p => p !== f1 && p.startsWith(path.dirname(f1))),
+      `restored=${JSON.stringify(rest.restored)}`);
+    info = await t.trashInfo(volDir);
+    check('emptied-out Trash reports nothing left', info.files === 0, JSON.stringify(info.sessions));
+
+    // empty frees the space and reports it
+    await t.trashAndUpdate([f2]);
+    const before2 = (await t.trashInfo(volDir)).bytes;
+    const emptied = await t.emptyNebulaTrash(volDir, null);
+    check('empty reports the freed bytes and removes the folder', emptied.removed === 1 && emptied.bytes === before2 && !fs.existsSync(t.nebulaTrashRoot(volDir)),
+      JSON.stringify(emptied));
+    t.setVolumeResolver(null);
+
     console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL STATE/TRASH CHECKS PASSED');
     app.exit(failures ? 1 : 0);
   } catch (e) {

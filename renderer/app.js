@@ -56,6 +56,7 @@ const S = {
   dupeStrategy: 'smart',
   savedDupes: null,     // meta of the last persisted analysis for this root
   dupeCleanup: null,    // summary of the last Trash operation (what moved, where)
+  trashInfo: null,      // what is waiting in removed-copies storage for this volume
   largest: { category: null, query: '', rows: [], limit: 150 },
   similar: null,
   photoSelection: new Set(),
@@ -284,7 +285,11 @@ function setView(name) {
   if (NEEDS_SCAN.has(name) && !S.overview) { renderScanGate(name); return; }
   if (name === 'dashboard') renderDashboard();
   if (name === 'storage') { if (!S.storageDir) S.storageDir = S.root; loadStorage(S.storageDir); }
-  if (name === 'dupes') renderDupes();
+  if (name === 'dupes') {
+    renderDupes();
+    // what removed copies are waiting on this drive is discovered asynchronously
+    refreshTrashInfo().then(() => { if (S.view === 'dupes' && S.trashInfo) renderDupes(); });
+  }
   if (name === 'largest') refreshLargest();
   if (name === 'photos') renderPhotos();
   if (name === 'changes') renderChanges();
@@ -898,6 +903,7 @@ function renderDupes() {
         <div class="view-sub">${fmtNum(d.scannedFiles)} files analyzed</div>
       </div></div>
       ${cleanupSummaryHtml()}
+      ${nebulaTrashPanelHtml()}
       <div class="panel dupe-idle">
         <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg></div>
         <h3>No duplicates found</h3>
@@ -924,6 +930,7 @@ function renderDupes() {
     </div></div>
 
     ${cleanupSummaryHtml()}
+    ${nebulaTrashPanelHtml()}
 
     <div class="dupe-toolbar">
       <label class="dupe-filter"><input type="checkbox" id="flt-samename" ${flt.sameName ? 'checked' : ''}> Same name only</label>
@@ -1201,21 +1208,27 @@ api.onTrashProgress(p => {
 
 // A cleanup must never be a black box: the summary stays on screen until the
 // next analysis, and says exactly what moved, what failed and where the files
-// went — including whether that drive keeps its own Trash (space is only freed
-// once that Trash is emptied).
+// went — either the drive-local "Nebula Trash" folder (visible, restorable,
+// emptyable in-app) or the system Trash on the startup disk.
 function cleanupSummaryHtml() {
   const c = S.dupeCleanup;
   if (!c) return '';
-  const vols = c.volumes || [];
-  const volLines = vols.map(v => `
-    <div class="cleanup-vol">
-      <div class="cleanup-vol-head">${v.files ? `${fmtNum(v.files)} file${v.files === 1 ? '' : 's'} · ${esc(fmtBytes(v.bytes))} moved on <strong>${esc(v.volume)}</strong>` : `On <strong>${esc(v.volume)}</strong>`}</div>
-      ${v.trashDir
-        ? `<div class="dupe-note">They are in <code>${esc(v.trashDir)}</code> — a per-drive Trash that Finder often does not show, and the space is only freed once that Trash is emptied.</div>
-           <div class="dupe-note cleanup-trash-status" data-trash-status="${esc(v.volume)}">Checking that drive's Trash…</div>
-           <button class="btn btn-ghost btn-small" data-empty-volume="${esc(v.volume)}">Empty ${esc(v.volume)} Trash…</button>`
-        : `<div class="dupe-note">They are in the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}.</div>`}
-    </div>`).join('');
+  const dests = c.destinations || [];
+  const destLines = dests.map(d => {
+    const where = d.mode === 'nebula'
+      ? `<code>${esc(d.dir)}</code> — Nebula's own Trash folder on <strong>${esc(d.volume)}</strong>. It stays visible in Finder, and nothing is freed until you empty it.`
+      : `<code>${esc(d.dir || '')}</code> — the system Trash${d.volume && d.volume !== '/' ? ` on <strong>${esc(d.volume)}</strong>` : ''}.`;
+    const actions = d.mode === 'nebula'
+      ? `<button class="btn btn-ghost btn-small" data-restore-session="${esc(d.session || '')}" data-volume="${esc(d.volume)}">Restore these files</button>
+         <button class="btn btn-danger btn-small" data-empty-session="${esc(d.session || '')}" data-volume="${esc(d.volume)}">Empty — free ${esc(fmtBytes(d.bytes))}</button>`
+      : `<button class="btn btn-ghost btn-small" data-empty-volume="${esc(d.volume)}">Empty ${esc(d.volume)} Trash…</button>`;
+    return `
+      <div class="cleanup-vol">
+        <div class="cleanup-vol-head">${d.files ? `${fmtNum(d.files)} file${d.files === 1 ? '' : 's'} · ${esc(fmtBytes(d.bytes))} moved` : `On <strong>${esc(d.volume)}</strong>`}</div>
+        <div class="dupe-note">${where}</div>
+        ${actions}
+      </div>`;
+  }).join('');
   const failed = c.failed || [];
   const failedHtml = failed.length ? `
     <div class="cleanup-failed">
@@ -1229,13 +1242,37 @@ function cleanupSummaryHtml() {
     <div class="panel dupe-cleanup ${failed.length ? 'has-failures' : ''}">
       <div class="cleanup-head">
         <div>
-          <h3>${c.moved ? `Moved ${fmtNum(c.moved)} files (${esc(fmtBytes(c.bytes))}) to Trash` : 'Nothing was moved to Trash'}</h3>
+          <h3>${c.moved ? `Moved ${fmtNum(c.moved)} files (${esc(fmtBytes(c.bytes))}) out of the way` : 'Nothing was moved'}</h3>
           <div class="dupe-note">${c.at ? esc(fmtDate(c.at)) : ''}</div>
         </div>
         <button class="btn btn-ghost btn-small" id="btn-dismiss-cleanup">Dismiss</button>
       </div>
-      ${volLines}
+      ${destLines}
       ${failedHtml}
+    </div>`;
+}
+
+// Anything already sitting in a drive-local Nebula Trash is always reachable —
+// not only right after a cleanup.
+function nebulaTrashPanelHtml() {
+  const info = S.trashInfo;
+  if (!info || info.mode !== 'nebula' || !info.files) return '';
+  const sessions = (info.sessions || []).map(s => `
+    <div class="cleanup-vol">
+      <div class="cleanup-vol-head">${fmtNum(s.files)} files · ${esc(fmtBytes(s.bytes))} — removed ${esc(fmtDate(s.at))}</div>
+      <button class="btn btn-ghost btn-small" data-restore-session="${esc(s.id)}" data-volume="${esc(info.volume)}">Restore</button>
+      <button class="btn btn-danger btn-small" data-empty-session="${esc(s.id)}" data-volume="${esc(info.volume)}">Empty — free ${esc(fmtBytes(s.bytes))}</button>
+    </div>`).join('');
+  return `
+    <div class="panel dupe-cleanup">
+      <div class="cleanup-head">
+        <div>
+          <h3>${fmtNum(info.files)} removed copies (${esc(fmtBytes(info.bytes))}) in Nebula Trash</h3>
+          <div class="dupe-note">On <strong>${esc(info.volume)}</strong> at <code>${esc(info.dir)}</code> — visible in Finder, restorable, and never scanned as duplicates.</div>
+        </div>
+        <button class="btn btn-danger btn-small" data-empty-all="${esc(info.volume)}">Empty all — free ${esc(fmtBytes(info.bytes))}</button>
+      </div>
+      ${sessions}
     </div>`;
 }
 
@@ -1244,11 +1281,19 @@ function wireCleanupSummary() {
   if (!el) return;
   const dismiss = el.querySelector('#btn-dismiss-cleanup');
   if (dismiss) dismiss.addEventListener('click', () => { S.dupeCleanup = null; renderDupes(); });
+
+  el.querySelectorAll('[data-restore-session]').forEach(btn =>
+    btn.addEventListener('click', () => restoreFromNebulaTrash(btn.dataset.volume, btn.dataset.restoreSession || null)));
+  el.querySelectorAll('[data-empty-session]').forEach(btn =>
+    btn.addEventListener('click', () => emptyNebulaTrashFlow(btn.dataset.volume, btn.dataset.emptySession || null)));
+  el.querySelectorAll('[data-empty-all]').forEach(btn =>
+    btn.addEventListener('click', () => emptyNebulaTrashFlow(btn.dataset.emptyAll, null)));
   el.querySelectorAll('[data-empty-volume]').forEach(btn =>
     btn.addEventListener('click', () => emptyVolumeTrashFlow(btn.dataset.emptyVolume, btn)));
+
   // Ask the main process what is actually sitting in each drive's Trash — on
-  // macOS that may be unreadable without Full Disk Access, and the user needs to
-  // know that rather than assume the cleanup did nothing.
+  // macOS the system Trash may be unreadable without Full Disk Access, and the
+  // user needs to know that rather than assume the cleanup did nothing.
   el.querySelectorAll('[data-trash-status]').forEach(async node => {
     const volume = node.dataset.trashStatus;
     const info = await api.volumeTrashInfo(volume);
@@ -1261,6 +1306,54 @@ function wireCleanupSummary() {
       node.textContent = `That Trash is currently empty.`;
     }
   });
+}
+
+async function refreshTrashInfo() {
+  S.trashInfo = null;
+  if (!S.root) return;
+  const volume = (S.dupeCleanup && S.dupeCleanup.destinations && S.dupeCleanup.destinations[0] && S.dupeCleanup.destinations[0].volume) || null;
+  const target = volume || S.root;
+  const info = await api.trashInfo(target);
+  if (info && !info.error) S.trashInfo = info;
+}
+
+// Put removed copies back exactly where they came from.
+async function restoreFromNebulaTrash(volume, sessionId) {
+  const ok = await confirmModal({
+    title: 'Restore these files?',
+    body: `The removed copies will be moved back to their original paths on <strong>${esc(volume)}</strong>. Anything that already exists at an original path is left alone — the restored file gets a new name instead.`,
+    confirmLabel: 'Restore',
+  });
+  if (!ok) return;
+  const res = await api.restoreTrash(volume, sessionId);
+  if (res && res.error) { toast(res.error, false, 9000); return; }
+  if (res.failed && res.failed.length) toast(`Restored ${fmtNum(res.restored)} files — ${fmtNum(res.failed.length)} could not be restored`, false, 9000);
+  else toast(`Restored ${fmtNum(res.restored)} files to their original folders`);
+  S.dupeCleanup = null;
+  await refreshTrashInfo();
+  renderDupes();
+}
+
+async function emptyNebulaTrashFlow(volume, sessionId) {
+  const info = await api.trashInfo(volume);
+  if (info && info.error) { toast(info.error, false, 9000); return; }
+  const files = sessionId ? ((info.sessions || []).find(s => s.id === sessionId) || {}).files : info.files;
+  const bytes = sessionId ? ((info.sessions || []).find(s => s.id === sessionId) || {}).bytes : info.bytes;
+  const ok = await confirmModal({
+    title: sessionId ? 'Permanently delete this session?' : `Permanently delete everything on ${volume}?`,
+    body: `<strong>${fmtNum(files)} files (${esc(fmtBytes(bytes))})</strong> in <code>${esc(info.dir)}</code> will be deleted for good and the space will be freed. This cannot be undone.`,
+    confirmLabel: 'Delete permanently',
+    danger: true,
+  });
+  if (!ok) return;
+  const res = await api.emptyTrash(volume, sessionId);
+  if (res && res.error) { toast(res.error, false, 12000); return; }
+  toast(`Freed ${fmtBytes(res.bytes)} — permanently deleted ${fmtNum(res.removed)} files`);
+  if (S.dupeCleanup && S.dupeCleanup.destinations) {
+    S.dupeCleanup.destinations = S.dupeCleanup.destinations.filter(d => d.mode !== 'nebula');
+  }
+  await refreshTrashInfo();
+  renderDupes();
 }
 
 // Permanently emptying a drive's Trash is what actually reclaims the space, so
@@ -1321,8 +1414,8 @@ async function trashSelectedDupes() {
   const bytes = selectionBytes();
   const ok = await confirmModal({
     title: 'Move to Trash?',
-    body: `<strong>${fmtNum(paths.length)} files</strong> (${esc(fmtBytes(bytes))}) will be moved to the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}. ` +
-      `You can restore them from there at any time.<br><br><span class="dupe-note">On an external drive the files go to that drive's own Trash, and the space is reclaimed only when that Trash is emptied — Nebula will show you where they went.</span>`,
+    body: `<strong>${fmtNum(paths.length)} files</strong> (${esc(fmtBytes(bytes))}) will be moved out of the way. You can restore them at any time.<br><br>` +
+      `<span class="dupe-note">On an external drive they go to a <strong>“Nebula Trash” folder on that drive</strong> — visible in Finder, restorable and emptyable right here, and it is never scanned as duplicates. On the startup disk they go to the normal ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}.</span>`,
     confirmLabel: 'Move to Trash',
     danger: true,
   });
@@ -1367,11 +1460,12 @@ async function trashSelectedDupes() {
   S.dupeCleanup = {
     at: Date.now(),
     moved: res.trashed.length,
-    bytes: (res.volumes || []).reduce((s, v) => s + (v.bytes || 0), 0) || bytes,
+    bytes: (res.destinations || []).reduce((s, d) => s + (d.bytes || 0), 0) || bytes,
     failed: res.failed || [],
-    volumes: res.volumes || [],
+    destinations: res.destinations || [],
   };
   S.overview = await api.overview(); // dashboard KPIs follow the cleanup
+  await refreshTrashInfo();
 
   const badge = $('#dupe-badge');
   if (S.dupes.groupCount > 0) { badge.textContent = fmtNum(S.dupes.groupCount); badge.hidden = false; }

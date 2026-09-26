@@ -22,13 +22,23 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
   along with every content fingerprint, so a **second run only reads files that
   actually changed** (a 120k-file set re-analyzes in ~80 ms instead of
   re-hashing from scratch) and results can be restored after a restart.
-- **Honest cleanup reporting** — after moving copies to the Trash, Nebula shows
-  what moved, what failed and why, and *where the files went*: files on an
-  external drive go to that drive's own Trash (`/Volumes/<drive>/.Trashes/<uid>`),
-  which Finder often does not display and which only frees space once emptied —
-  so there's a one-click "Empty this drive's Trash" action next to the summary.
-  Every move is verified against the filesystem; a failed move is never reported
-  as a cleanup, and never removes files from the analysis.
+- **Honest cleanup reporting** — after moving copies out of the way, Nebula shows
+  what moved, what failed and why, and *where the files went*. Removed copies on
+  an external drive go to a **`Nebula Trash` folder on that drive** (see below),
+  on the startup disk to the normal Trash. Every move is verified against the
+  filesystem; a failed move is never reported as a cleanup, and never removes
+  files from the analysis.
+- **Nebula Trash (drive-local, restorable)** — on any volume other than the
+  startup disk, removed copies are moved into `<drive>/Nebula Trash/<session>/`,
+  keeping each file's path relative to the drive. That folder is *visible in
+  Finder*, browsable in the app (per session, with file counts and sizes),
+  **restorable** to the exact original paths (an occupied path gets a
+  collision-safe name instead of being overwritten), and **emptyable** with one
+  confirmed action — which is what actually frees the space. This exists because
+  a drive's own `.Trashes/<uid>` folder is invisible to Finder and unreadable to
+  apps without Full Disk Access, so files moved there look like they vanished and
+  the space stays used. Nebula never scans its own Trash folders, so removed
+  copies can never reappear as duplicates.
 - **Similar Photos** — perceptual (dHash) fingerprinting clusters resized,
   re-exported, and lightly edited versions of the same shot, with thumbnails.
   Auto-select keeps the sharpest (highest-resolution) copy of each group.
@@ -77,7 +87,8 @@ NEBULA_NO_WINDOW=1 ELECTRON_DISABLE_SANDBOX=1 npx electron test/state.js  /tmp/n
 
 `smoke.js` covers scanning, similar photos, the changes diff, compare and
 organize. `state.js` covers the persisted analysis + fingerprint cache (reuse,
-invalidation, restore) and the Trash path (verified moves, honest failures, and
+invalidation, restore) and the Trash paths (verified moves, honest failures, the
+drive-local Nebula Trash round-trip: move → restore → empty, scan exclusion, and
 per-volume Trash reporting).
 
 > macOS note: `test/state.js` moves a file to the Trash, which needs permission
