@@ -1461,6 +1461,9 @@ function volumeOf(p) {
 function volumeTrashDir(volume) {
   if (!volume) return null;
   if (process.platform === 'win32') return null; // Recycle Bin has no browsable path
+  // The boot volume keeps its Trash in the home folder; every other volume has
+  // its own .Trashes/<uid> (which is exactly why files "vanish" on external drives).
+  if (volume === path.sep) return path.join(os.homedir(), '.Trash');
   return path.join(volume, '.Trashes', String(process.getuid()));
 }
 
@@ -1475,22 +1478,33 @@ function isAuthorizedVolume(volume) {
 }
 
 async function dirStats(dir, cap = 200000) {
-  let items = 0, bytes = 0;
+  let items = 0, bytes = 0, unreadable = 0;
   const stack = [dir];
   while (stack.length) {
     const cur = stack.pop();
     let entries;
     try { entries = await fsp.readdir(cur, { withFileTypes: true }); }
-    catch { continue; }
+    catch { unreadable++; continue; } // "cannot read" is NOT "empty" — never report it as such
     for (const ent of entries) {
       const full = path.join(cur, ent.name);
       if (ent.isDirectory()) { stack.push(full); continue; }
       items++;
-      if (items > cap) return { items, bytes, capped: true };
+      if (items > cap) return { items, bytes, unreadable, capped: true };
       try { bytes += (await fsp.stat(full)).size; } catch { /* gone already */ }
     }
   }
-  return { items, bytes, capped: false };
+  return { items, bytes, unreadable, capped: false };
+}
+
+// macOS protects Trash directories, so an app without Full Disk Access can move
+// files into a drive's Trash but cannot enumerate it. Say so plainly instead of
+// pretending the Trash is empty.
+function trashUnreadableMessage(dir, err) {
+  const detail = err ? ` (${err})` : '';
+  return `macOS would not let Nebula read ${dir}${detail}. Empty it from Finder instead: ` +
+    'hold Option and click the Trash icon in the Dock, then choose “Empty Trash” for this drive — ' +
+    'or grant Nebula Full Disk Access in System Settings → Privacy & Security. ' +
+    'Until then the files stay in that drive\'s Trash and the space stays used.';
 }
 
 const withTimeout = (promise, ms, message) => Promise.race([
@@ -1595,7 +1609,10 @@ ipcMain.handle('trash:volumeInfo', async (_e, volume) => {
     if (!dir) return { volume, trashDir: null, ok: false, error: 'This platform has no browsable Trash path.' };
     const st = await fsp.stat(dir).catch(() => null);
     if (!st) return { volume, trashDir: dir, ok: true, items: 0, bytes: 0, empty: true };
-    const { items, bytes, capped } = await dirStats(dir);
+    const { items, bytes, unreadable, capped } = await dirStats(dir);
+    if (unreadable && !items) {
+      return { volume, trashDir: dir, ok: false, readable: false, error: trashUnreadableMessage(dir) };
+    }
     return { volume, trashDir: dir, ok: true, items, bytes, capped, empty: items === 0 };
   } catch (err) {
     return { volume, trashDir: volumeTrashDir(volume), ok: false, error: String((err && err.message) || err) };
@@ -1613,13 +1630,7 @@ ipcMain.handle('trash:emptyVolume', async (_e, volume) => {
     let entries;
     try { entries = await fsp.readdir(dir); }
     catch (err) {
-      return {
-        error: `macOS would not let Nebula read ${dir} (${(err && err.message) || err}). ` +
-          'Empty it from Finder instead: click the Trash icon in the Dock while holding Option, ' +
-          'then choose “Empty Trash” for this drive — or grant Nebula Full Disk Access in ' +
-          'System Settings → Privacy & Security.',
-        dir, freed: 0, items: 0,
-      };
+      return { error: trashUnreadableMessage(dir, (err && err.message) || err), dir, freed: 0, items: 0 };
     }
     let removed = 0;
     const failed = [];

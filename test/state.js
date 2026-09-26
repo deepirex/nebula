@@ -116,9 +116,22 @@ app.whenReady().then(async () => {
     // ---- 7. volume + Trash-path reporting
     const vol = t.volumeOf(goneFile);
     const trashDir = t.volumeTrashDir(vol);
+    const uid = String(process.getuid());
     check('volume detected for a path', typeof vol === 'string' && vol.length > 0, `volume=${vol}`);
-    check('per-volume Trash path reported', process.platform === 'win32' ? trashDir === null : trashDir.endsWith(path.join('.Trashes', String(process.getuid()))),
+    check('boot volume points at ~/.Trash', process.platform === 'win32' ? trashDir === null : trashDir === path.join(require('os').homedir(), '.Trash'),
       `trashDir=${trashDir}`);
+    check('external volume points at its own .Trashes/<uid>', t.volumeTrashDir('/Volumes/Intel') === path.join('/Volumes/Intel', '.Trashes', uid),
+      `trashDir=${t.volumeTrashDir('/Volumes/Intel')}`);
+
+    // an unreadable Trash must never be reported as empty
+    const locked = path.join(work, 'locked-trash');
+    fs.mkdirSync(locked, { recursive: true });
+    fs.writeFileSync(path.join(locked, 'hidden.bin'), 'x');
+    fs.chmodSync(locked, 0o000);
+    const stats = await t.dirStats(locked);
+    check('unreadable Trash is flagged, not counted as empty', stats.unreadable === 1 && stats.items === 0,
+      JSON.stringify(stats));
+    fs.chmodSync(locked, 0o755);
 
     console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL STATE/TRASH CHECKS PASSED');
     app.exit(failures ? 1 : 0);

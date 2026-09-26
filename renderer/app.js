@@ -1212,6 +1212,7 @@ function cleanupSummaryHtml() {
       <div class="cleanup-vol-head">${v.files ? `${fmtNum(v.files)} file${v.files === 1 ? '' : 's'} · ${esc(fmtBytes(v.bytes))} moved on <strong>${esc(v.volume)}</strong>` : `On <strong>${esc(v.volume)}</strong>`}</div>
       ${v.trashDir
         ? `<div class="dupe-note">They are in <code>${esc(v.trashDir)}</code> — a per-drive Trash that Finder often does not show, and the space is only freed once that Trash is emptied.</div>
+           <div class="dupe-note cleanup-trash-status" data-trash-status="${esc(v.volume)}">Checking that drive's Trash…</div>
            <button class="btn btn-ghost btn-small" data-empty-volume="${esc(v.volume)}">Empty ${esc(v.volume)} Trash…</button>`
         : `<div class="dupe-note">They are in the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}.</div>`}
     </div>`).join('');
@@ -1245,6 +1246,21 @@ function wireCleanupSummary() {
   if (dismiss) dismiss.addEventListener('click', () => { S.dupeCleanup = null; renderDupes(); });
   el.querySelectorAll('[data-empty-volume]').forEach(btn =>
     btn.addEventListener('click', () => emptyVolumeTrashFlow(btn.dataset.emptyVolume, btn)));
+  // Ask the main process what is actually sitting in each drive's Trash — on
+  // macOS that may be unreadable without Full Disk Access, and the user needs to
+  // know that rather than assume the cleanup did nothing.
+  el.querySelectorAll('[data-trash-status]').forEach(async node => {
+    const volume = node.dataset.trashStatus;
+    const info = await api.volumeTrashInfo(volume);
+    if (!node.isConnected) return;
+    if (info && info.error) {
+      node.innerHTML = `<span class="cleanup-warn">Nebula can't read that Trash (macOS protects it): ${esc(info.error)}</span>`;
+    } else if (info && info.items) {
+      node.textContent = `${fmtNum(info.items)} items (${fmtBytes(info.bytes)}) are waiting there — emptying it frees the space.`;
+    } else if (info) {
+      node.textContent = `That Trash is currently empty.`;
+    }
+  });
 }
 
 // Permanently emptying a drive's Trash is what actually reclaims the space, so
