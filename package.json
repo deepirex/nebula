@@ -16,6 +16,7 @@
   "build": {
     "appId": "com.deepirex.nebula",
     "productName": "Nebula",
+    "afterPack": "build/after-pack.js",
     "files": [
       "main.js",
       "preload.js",
