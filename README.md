@@ -18,7 +18,17 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
   keep oldest. Removal goes to the Trash/Recycle Bin, never a permanent delete.
 - **Instant reopen** — every completed scan is saved to a compressed index, so
   the next launch offers "Resume last session" and restores the full dashboard
-  in moments without rescanning.
+  in moments without rescanning. Duplicate analyses are saved the same way,
+  along with every content fingerprint, so a **second run only reads files that
+  actually changed** (a 120k-file set re-analyzes in ~80 ms instead of
+  re-hashing from scratch) and results can be restored after a restart.
+- **Honest cleanup reporting** — after moving copies to the Trash, Nebula shows
+  what moved, what failed and why, and *where the files went*: files on an
+  external drive go to that drive's own Trash (`/Volumes/<drive>/.Trashes/<uid>`),
+  which Finder often does not display and which only frees space once emptied —
+  so there's a one-click "Empty this drive's Trash" action next to the summary.
+  Every move is verified against the filesystem; a failed move is never reported
+  as a cleanup, and never removes files from the analysis.
 - **Similar Photos** — perceptual (dHash) fingerprinting clusters resized,
   re-exported, and lightly edited versions of the same shot, with thumbnails.
   Auto-select keeps the sharpest (highest-resolution) copy of each group.
@@ -55,6 +65,23 @@ Grab the installer for your device from the
 > isn't — that's the quarantine flag on unsigned downloads. Clear it once:
 > `xattr -cr /Applications/Nebula.app`, then open Nebula normally.
 > On **Windows**, if SmartScreen appears: **More info** → **Run anyway**.
+
+## Tests
+
+Headless engine tests (no window, real Electron APIs):
+
+```bash
+NEBULA_NO_WINDOW=1 ELECTRON_DISABLE_SANDBOX=1 npx electron test/smoke.js  /tmp/nebula-smoke
+NEBULA_NO_WINDOW=1 ELECTRON_DISABLE_SANDBOX=1 npx electron test/state.js  /tmp/nebula-state
+```
+
+`smoke.js` covers scanning, similar photos, the changes diff, compare and
+organize. `state.js` covers the persisted analysis + fingerprint cache (reuse,
+invalidation, restore) and the Trash path (verified moves, honest failures, and
+per-volume Trash reporting).
+
+> macOS note: `test/state.js` moves a file to the Trash, which needs permission
+> to write `~/.Trash`; run it outside any restricted sandbox.
 
 ## Run it
 

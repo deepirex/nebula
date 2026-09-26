@@ -54,6 +54,8 @@ const S = {
   dupeFilters: { sameName: false, minSize: 0, query: '' },
   dupeExpanded: new Set(),
   dupeStrategy: 'smart',
+  savedDupes: null,     // meta of the last persisted analysis for this root
+  dupeCleanup: null,    // summary of the last Trash operation (what moved, where)
   largest: { category: null, query: '', rows: [], limit: 150 },
   similar: null,
   photoSelection: new Set(),
@@ -305,7 +307,7 @@ function enableNav() {
 function currentOp() {
   if (S.scanning) return { view: 'scanning', label: 'Scanning folder', cancel: () => api.cancelScan() };
   if (S.op) {
-    const cancel = {
+    const cancel = S.op.cancel || {
       dupes: () => api.cancelDupes(),
       photos: () => api.cancelPhotos(),
       compare: () => api.compareCancel(),
@@ -353,6 +355,8 @@ async function startScan(root) {
   S.storageDir = null;
   S.dupes = null;
   S.dupeSelection = new Set();
+  S.dupeCleanup = null;
+  S.savedDupes = null;
   S.similar = null;
   S.photoSelection = new Set();
   $('#dupe-badge').hidden = true;
@@ -378,6 +382,7 @@ async function startScan(root) {
   S.overview = await api.overview();
   enableNav();
   updateRootCard(res);
+  await refreshSavedDupes(); // offer the saved analysis for this root instead of a re-run
 
   if (res.cancelled) toast('Scan cancelled — showing partial results');
   else if (res.errors > 0) toast(`Scan complete. ${fmtNum(res.errors)} items were skipped (no permission).`);
@@ -440,6 +445,7 @@ async function resumeSavedIndex(btn) {
   S.overview = await api.overview();
   enableNav();
   updateRootCard(res);
+  await refreshSavedDupes(); // a saved duplicate analysis may exist for this root
   toast('Previous scan restored instantly — hit Rescan if the folder changed');
   setView('dashboard');
 }
@@ -874,8 +880,12 @@ function renderDupes() {
         <h3>Find duplicate files</h3>
         <p>Nebula groups files by exact size, fingerprints candidates, then confirms matches with full content hashes — so identical names aren't enough and identical content never escapes.</p>
         <button class="btn btn-primary" id="btn-run-dupes" ${busy ? 'disabled' : ''}>${busy ? `${esc(S.op ? S.op.label : 'Scanning')}…` : `Analyze ${S.overview ? fmtNum(S.overview.fileCount) + ' files' : 'scan'}`}</button>
-      </div>`;
+        ${S.savedDupes && S.savedDupes.cachedHashes ? `<div class="dupe-note">${fmtNum(S.savedDupes.cachedHashes)} files are already fingerprinted — the next run only reads what changed.</div>` : ''}
+      </div>
+      ${savedDupesHtml()}`;
     $('#btn-run-dupes').addEventListener('click', runDupeAnalysis);
+    const restore = $('#btn-restore-dupes');
+    if (restore) restore.addEventListener('click', restoreSavedDupes);
     maybeAnimate(el);
     return;
   }
@@ -887,6 +897,7 @@ function renderDupes() {
         <div class="view-title">Duplicates</div>
         <div class="view-sub">${fmtNum(d.scannedFiles)} files analyzed</div>
       </div></div>
+      ${cleanupSummaryHtml()}
       <div class="panel dupe-idle">
         <div class="dupe-idle-icon"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg></div>
         <h3>No duplicates found</h3>
@@ -894,6 +905,7 @@ function renderDupes() {
         <button class="btn btn-ghost" id="btn-rerun-dupes">Re-analyze</button>
       </div>`;
     $('#btn-rerun-dupes').addEventListener('click', runDupeAnalysis);
+    wireCleanupSummary();
     maybeAnimate(el);
     return;
   }
@@ -910,6 +922,8 @@ function renderDupes() {
       <div class="view-title">Duplicates</div>
       <div class="view-sub">${fmtNum(groups.length)} sets${groups.length !== d.groupCount ? ` (filtered from ${fmtNum(d.groupCount)})` : ''} · <strong style="color:#ff9d9d">${fmtBytes(wastedFiltered)}</strong> reclaimable</div>
     </div></div>
+
+    ${cleanupSummaryHtml()}
 
     <div class="dupe-toolbar">
       <label class="dupe-filter"><input type="checkbox" id="flt-samename" ${flt.sameName ? 'checked' : ''}> Same name only</label>
@@ -977,6 +991,7 @@ function renderDupes() {
     const p = e.target.closest('.dupe-file-path');
     if (p) api.reveal(p.dataset.path);
   });
+  wireCleanupSummary();
   maybeAnimate(el);
 }
 
@@ -1089,44 +1104,68 @@ function updateDupeToolbar() {
 // Draw the duplicate-analysis progress screen. Called both when the run starts
 // and when the user navigates back to the tab mid-run, so it re-applies the last
 // progress payload to restore the phase text and bar rather than resetting them.
+// Also used for the "moving to Trash" step, which is just as long on a big set.
 function renderDupeProgress() {
   const el = $('#view-dupes');
+  const trashing = !!(S.op && S.op.trashing);
   el.innerHTML = `
     <div class="view-head"><div>
       <div class="view-title">Duplicates</div>
-      <div class="view-sub">Analyzing content…</div>
+      <div class="view-sub">${trashing ? 'Moving the selected copies to Trash…' : 'Analyzing content…'}</div>
     </div></div>
     <div class="dupe-progress">
       ${LOADER_DOTS}
-      <div class="dupe-progress-label" id="dupe-phase">Grouping by size…</div>
+      <div class="dupe-progress-label" id="dupe-phase">${trashing ? 'Preparing…' : 'Grouping by size…'}</div>
       <div class="progress-track"><div class="progress-fill" id="dupe-fill" style="width:2%"></div></div>
       <button class="btn btn-ghost" id="btn-cancel-dupes">Cancel</button>
     </div>`;
-  $('#btn-cancel-dupes').addEventListener('click', () => api.cancelDupes());
+  $('#btn-cancel-dupes').addEventListener('click', () => (S.op && S.op.cancel ? S.op.cancel() : api.cancelDupes()));
   if (S.op && S.op.view === 'dupes' && S.op.progress) applyDupeProgress(S.op.progress);
+}
+
+// "Resume the analysis that is already on disk" — offered whenever a saved
+// result for the open root exists, so a big volume never needs a second pass
+// (and the cached hashes make any re-run incremental anyway).
+function savedDupesHtml() {
+  const d = S.savedDupes;
+  if (!d) return '';
+  return `
+    <div class="panel dupe-saved">
+      <div class="dupe-saved-text">
+        <strong>Last analysis saved</strong> — ${fmtNum(d.groupCount)} duplicate sets ·
+        <strong>${esc(fmtBytes(d.totalWasted))}</strong> reclaimable · ${fmtNum(d.scannedFiles)} files
+        ${d.savedAt ? `<span class="dupe-saved-when">analyzed ${esc(fmtDate(d.savedAt))}</span>` : ''}
+        <div class="dupe-note">Restore it instantly, or re-analyze — unchanged files are skipped using the saved fingerprints.</div>
+      </div>
+      <button class="btn btn-ghost" id="btn-restore-dupes">⚡ Restore results</button>
+    </div>`;
 }
 
 async function runDupeAnalysis() {
   if (S.scanning || S.op) { toast('Please wait — an analysis is already running', false); return; }
   S.op = { view: 'dupes', label: 'Analyzing duplicates', progress: null };
+  S.dupeCleanup = null;
   refreshBusyUI();
   renderDupeProgress();
 
   const res = await api.findDuplicates();
   S.op = null;
   refreshBusyUI();
-  if (res && res.error) { toast(res.error, false); S.dupes = null; renderDupes(); return; }
-  if (res && res.cancelled) { toast('Duplicate analysis cancelled'); S.dupes = null; renderDupes(); return; }
+  if (res && res.error) { toast(res.error, false); renderDupes(); return; }
+  if (res && res.cancelled) { toast('Duplicate analysis cancelled'); renderDupes(); return; }
 
   S.dupes = res;
   S.dupeSelection = new Set();
   S.dupeGroupsShown = 80;
   S.animNext = true;
+  await refreshSavedDupes(); // the run just persisted itself
+  S.overview = await api.overview();
 
   const badge = $('#dupe-badge');
   if (res.groupCount > 0) { badge.textContent = fmtNum(res.groupCount); badge.hidden = false; }
   else badge.hidden = true;
 
+  if (res.cachedHashes) toast(`Analyzed ${fmtNum(res.scannedFiles)} files — ${fmtNum(res.cachedHashes)} fingerprints reused from the previous run`);
   renderDupes();
 }
 
@@ -1134,11 +1173,15 @@ function applyDupeProgress(p) {
   const phase = $('#dupe-phase'), fill = $('#dupe-fill');
   if (!phase || !fill) return;
   const pct = p.total ? (p.done / p.total) * 100 : 100;
-  if (p.phase === 'quick') {
-    phase.textContent = `Pass 1 of 2 — fingerprinting ${fmtNum(p.total)} candidates (${fmtNum(p.done)} done)`;
+  if (p.phase === 'trash') {
+    phase.textContent = `Moving to Trash — ${fmtNum(p.done)} of ${fmtNum(p.total)} done` +
+      (p.trashed != null ? ` (${fmtNum(p.trashed)} moved${p.failed ? `, ${fmtNum(p.failed)} failed` : ''})` : '');
+    fill.style.width = `${pct.toFixed(1)}%`;
+  } else if (p.phase === 'quick') {
+    phase.textContent = `Pass 1 of 2 — fingerprinting ${fmtNum(p.total)} candidates (${fmtNum(p.done)} done${p.reused ? `, ${fmtNum(p.reused)} from cache` : ''})`;
     fill.style.width = `${(pct * 0.45).toFixed(1)}%`;
   } else {
-    phase.textContent = `Pass 2 of 2 — verifying content of ${fmtNum(p.total)} files (${fmtNum(p.done)} done)`;
+    phase.textContent = `Pass 2 of 2 — verifying content of ${fmtNum(p.total)} files (${fmtNum(p.done)} done${p.reused ? `, ${fmtNum(p.reused)} from cache` : ''})`;
     fill.style.width = `${(45 + pct * 0.55).toFixed(1)}%`;
   }
 }
@@ -1149,18 +1192,139 @@ api.onDupeProgress(p => {
   applyDupeProgress(p);
 });
 
+api.onTrashProgress(p => {
+  const withPhase = { ...p, phase: 'trash' };
+  if (S.op && S.op.view === 'dupes') S.op.progress = withPhase;
+  opCardSub(`${fmtNum(p.done)} / ${fmtNum(p.total)} moved`);
+  applyDupeProgress(withPhase);
+});
+
+// A cleanup must never be a black box: the summary stays on screen until the
+// next analysis, and says exactly what moved, what failed and where the files
+// went — including whether that drive keeps its own Trash (space is only freed
+// once that Trash is emptied).
+function cleanupSummaryHtml() {
+  const c = S.dupeCleanup;
+  if (!c) return '';
+  const vols = c.volumes || [];
+  const volLines = vols.map(v => `
+    <div class="cleanup-vol">
+      <div class="cleanup-vol-head">${v.files ? `${fmtNum(v.files)} file${v.files === 1 ? '' : 's'} · ${esc(fmtBytes(v.bytes))} moved on <strong>${esc(v.volume)}</strong>` : `On <strong>${esc(v.volume)}</strong>`}</div>
+      ${v.trashDir
+        ? `<div class="dupe-note">They are in <code>${esc(v.trashDir)}</code> — a per-drive Trash that Finder often does not show, and the space is only freed once that Trash is emptied.</div>
+           <button class="btn btn-ghost btn-small" data-empty-volume="${esc(v.volume)}">Empty ${esc(v.volume)} Trash…</button>`
+        : `<div class="dupe-note">They are in the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}.</div>`}
+    </div>`).join('');
+  const failed = c.failed || [];
+  const failedHtml = failed.length ? `
+    <div class="cleanup-failed">
+      <strong>${fmtNum(failed.length)} file${failed.length === 1 ? '' : 's'} could not be moved</strong> — they are still where they were, and still listed below.
+      <details><summary>Show reasons</summary>
+        <ul>${failed.slice(0, 25).map(f => `<li><code>${esc(f.path)}</code> — ${esc(f.error)}</li>`).join('')}
+        ${failed.length > 25 ? `<li>…and ${fmtNum(failed.length - 25)} more</li>` : ''}</ul>
+      </details>
+    </div>` : '';
+  return `
+    <div class="panel dupe-cleanup ${failed.length ? 'has-failures' : ''}">
+      <div class="cleanup-head">
+        <div>
+          <h3>${c.moved ? `Moved ${fmtNum(c.moved)} files (${esc(fmtBytes(c.bytes))}) to Trash` : 'Nothing was moved to Trash'}</h3>
+          <div class="dupe-note">${c.at ? esc(fmtDate(c.at)) : ''}</div>
+        </div>
+        <button class="btn btn-ghost btn-small" id="btn-dismiss-cleanup">Dismiss</button>
+      </div>
+      ${volLines}
+      ${failedHtml}
+    </div>`;
+}
+
+function wireCleanupSummary() {
+  const el = document.querySelector('#view-dupes');
+  if (!el) return;
+  const dismiss = el.querySelector('#btn-dismiss-cleanup');
+  if (dismiss) dismiss.addEventListener('click', () => { S.dupeCleanup = null; renderDupes(); });
+  el.querySelectorAll('[data-empty-volume]').forEach(btn =>
+    btn.addEventListener('click', () => emptyVolumeTrashFlow(btn.dataset.emptyVolume, btn)));
+}
+
+// Permanently emptying a drive's Trash is what actually reclaims the space, so
+// it is offered right where the cleanup finished — explicitly, never silently.
+async function emptyVolumeTrashFlow(volume, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  const info = await api.volumeTrashInfo(volume);
+  if (btn) { btn.disabled = false; btn.textContent = `Empty ${volume} Trash…`; }
+  if (info && info.error) { toast(info.error, false, 9000); return; }
+  if (!info.items) { toast(`That drive's Trash is already empty`); return; }
+  const ok = await confirmModal({
+    title: `Permanently delete everything in ${volume}'s Trash?`,
+    body: `<strong>${fmtNum(info.items)} items (${esc(fmtBytes(info.bytes))})</strong> in <code>${esc(info.trashDir)}</code> will be deleted for good${info.capped ? ' (at least — counting stopped early)' : ''}. This cannot be undone.`,
+    confirmLabel: 'Empty Trash',
+    danger: true,
+  });
+  if (!ok) return;
+  const res = await api.emptyVolumeTrash(volume);
+  if (res && res.error) { toast(res.error, false, 14000); return; }
+  toast(`Freed ${fmtBytes(res.bytes)} — removed ${fmtNum(res.removed)} items from that drive's Trash`);
+  S.dupeCleanup = null;
+  renderDupes();
+}
+
+// Bring back the analysis that is already saved on disk (no re-hashing).
+async function restoreSavedDupes() {
+  const btn = $('#btn-restore-dupes');
+  if (btn) { btn.disabled = true; btn.textContent = 'Restoring…'; }
+  const res = await api.loadDupes();
+  if (res && res.error) {
+    toast(`Couldn't restore the analysis: ${res.error}`, false);
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ Restore results'; }
+    return;
+  }
+  S.dupes = res;
+  S.dupeSelection = new Set();
+  S.dupeGroupsShown = 80;
+  S.dupeExpanded = new Set();
+  S.overview = await api.overview();
+  const badge = $('#dupe-badge');
+  if (res.groupCount > 0) { badge.textContent = fmtNum(res.groupCount); badge.hidden = false; }
+  else badge.hidden = true;
+  toast(`Restored ${fmtNum(res.groupCount)} duplicate sets from the saved analysis`);
+  renderDupes();
+}
+
+// Find out whether a saved analysis exists for the currently open root.
+async function refreshSavedDupes() {
+  S.savedDupes = null;
+  if (!S.root) return;
+  const info = await api.dupesInfo();
+  if (info && info.root === S.root) S.savedDupes = info;
+}
+
 async function trashSelectedDupes() {
   const paths = [...S.dupeSelection];
   if (!paths.length) return;
+  const bytes = selectionBytes();
   const ok = await confirmModal({
     title: 'Move to Trash?',
-    body: `<strong>${fmtNum(paths.length)} files</strong> (${esc(fmtBytes(selectionBytes()))}) will be moved to the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}. You can restore them from there at any time.`,
+    body: `<strong>${fmtNum(paths.length)} files</strong> (${esc(fmtBytes(bytes))}) will be moved to the ${api.platform === 'win32' ? 'Recycle Bin' : 'Trash'}. ` +
+      `You can restore them from there at any time.<br><br><span class="dupe-note">On an external drive the files go to that drive's own Trash, and the space is reclaimed only when that Trash is emptied — Nebula will show you where they went.</span>`,
     confirmLabel: 'Move to Trash',
     danger: true,
   });
   if (!ok) return;
 
+  S.op = { view: 'dupes', label: 'Moving files to Trash', trashing: true, progress: null, cancel: () => api.cancelTrash() };
+  refreshBusyUI();
+  renderDupeProgress();
+
   const res = await api.trash(paths);
+  S.op = null;
+  refreshBusyUI();
+  if (!res || res.error) {
+    toast(`Moving to Trash failed: ${(res && res.error) || 'unknown error'}`, false, 10000);
+    renderDupes();
+    return;
+  }
+
   const gone = new Set(res.trashed);
 
   // Mirror the main-process index update in the renderer's copy. Rows per group
@@ -1183,12 +1347,25 @@ async function trashSelectedDupes() {
   S.dupes.totalWasted = S.dupes.groups.reduce((s, g) => s + g.wasted, 0);
   S.dupeSelection = new Set([...S.dupeSelection].filter(p => !gone.has(p)));
 
+  // Keep the outcome visible instead of silently emptying the view.
+  S.dupeCleanup = {
+    at: Date.now(),
+    moved: res.trashed.length,
+    bytes: (res.volumes || []).reduce((s, v) => s + (v.bytes || 0), 0) || bytes,
+    failed: res.failed || [],
+    volumes: res.volumes || [],
+  };
+  S.overview = await api.overview(); // dashboard KPIs follow the cleanup
+
   const badge = $('#dupe-badge');
   if (S.dupes.groupCount > 0) { badge.textContent = fmtNum(S.dupes.groupCount); badge.hidden = false; }
   else badge.hidden = true;
 
-  if (res.failed.length) toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} failed`, false);
-  else toast(`Moved ${fmtNum(res.trashed.length)} files to Trash`);
+  if (res.failed.length) {
+    toast(`Moved ${fmtNum(res.trashed.length)} to Trash — ${fmtNum(res.failed.length)} could not be moved (see the summary)`, false, 9000);
+  } else {
+    toast(`Moved ${fmtNum(res.trashed.length)} files to Trash — see where they went below`);
+  }
   renderDupes();
 }
 

@@ -7,6 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { promisify } = require('util');
+const { pipeline } = require('stream/promises');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 
@@ -30,6 +31,10 @@ const state = {
   photoCancelled: false,
   similar: null,        // { clusters, totalSavings, ... }
   prevSnapshot: null,   // previous scan of the same root, for the Changes view
+  hashCache: new Map(), // path -> { size, mtime, quick, full } — survives restarts
+  hashCacheRoot: null,  // which root the cache above was loaded for
+  dupesSavedAt: null,   // when state.duplicates was last persisted
+  trashCancelled: false,
 };
 
 // ---------------------------------------------------------------- categories
@@ -289,6 +294,186 @@ async function loadIndex() {
   };
 }
 
+// ------------------------------------------------- persistent analysis cache
+//
+// Duplicate analysis on a big volume is expensive (millions of files, GBs of
+// hashing), so both the result and the per-file content hashes are persisted
+// next to the scan index. A later run reuses every hash whose size+mtime still
+// match and only re-reads files that actually changed, and the Duplicates view
+// can come back after a restart without re-analyzing anything.
+
+const DUPES_VERSION = 1;
+
+function dupesPaths() {
+  const dir = app.getPath('userData');
+  return { data: path.join(dir, 'dupes-v1.gz'), meta: path.join(dir, 'dupes-meta.json') };
+}
+
+const cacheMtime = mtime => Math.round(mtime || 0);
+
+function cachedHash(f, kind) {
+  const c = state.hashCache.get(f.path);
+  if (!c || c.size !== f.size || c.mtime !== cacheMtime(f.mtime)) return null;
+  return (kind === 'quick' ? c.quick : c.full) || null;
+}
+
+function rememberHash(f, kind, h) {
+  let c = state.hashCache.get(f.path);
+  if (!c || c.size !== f.size || c.mtime !== cacheMtime(f.mtime)) {
+    c = { size: f.size, mtime: cacheMtime(f.mtime) };
+    state.hashCache.set(f.path, c);
+  }
+  c[kind] = h;
+}
+
+// The analysis file is gzipped JSON-lines: the first line is the header (root,
+// saved timestamp, result), every following line is one cached fingerprint.
+// Streaming keeps saving/loading flat in memory even for millions of entries —
+// building one giant JSON string would reintroduce the very spike that used to
+// kill the app on big volumes.
+function dupesStream() {
+  const src = fs.createReadStream(dupesPaths().data);
+  const gz = zlib.createGunzip();
+  // A missing/corrupt file must reject the read, not throw an unhandled stream
+  // error that would take the whole main process down on first run.
+  src.on('error', err => gz.destroy(err));
+  const rl = require('readline').createInterface({ input: src.pipe(gz), crlfDelay: Infinity });
+  return { src, gz, rl };
+}
+
+async function readDupesHeader() {
+  const { src, gz, rl } = dupesStream();
+  try {
+    for await (const line of rl) {
+      if (line.trim()) return JSON.parse(line);
+    }
+    throw new Error('saved analysis file is empty');
+  } finally {
+    rl.close();
+    gz.destroy();
+    src.destroy();
+  }
+}
+
+async function streamHashes(onHash) {
+  const { src, gz, rl } = dupesStream();
+  let first = true;
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      if (first) { first = false; continue; } // header line
+      const [p, size, mtime, quick, full] = JSON.parse(line);
+      if (typeof p !== 'string' || !p) continue;
+      onHash(p, { size, mtime, quick: quick || null, full: full || null });
+    }
+  } finally {
+    rl.close();
+    gz.destroy();
+    src.destroy();
+  }
+}
+
+async function writeDupesState() {
+  const { data, meta } = dupesPaths();
+  const live = new Set(state.files.map(f => f.path)); // drop hashes for files that are gone
+  const header = {
+    v: DUPES_VERSION,
+    root: state.root,
+    savedAt: state.dupesSavedAt || Date.now(),
+    duplicates: state.duplicates,
+  };
+  const tmp = data + '.tmp';
+  let cachedHashes = 0;
+
+  async function* lines() {
+    yield JSON.stringify(header) + '\n';
+    let batch = [];
+    for (const [p, c] of state.hashCache) {
+      if (!live.has(p)) continue;
+      cachedHashes++;
+      batch.push(JSON.stringify(c.full ? [p, c.size, c.mtime, c.quick || null, c.full] : [p, c.size, c.mtime, c.quick || null]) + '\n');
+      if (batch.length >= 2000) { yield batch.join(''); batch = []; }
+    }
+    if (batch.length) yield batch.join('');
+  }
+
+  try {
+    // pipeline() owns the whole chain, so the gzip stream is always ended and
+    // errors surface instead of leaving a truncated file behind.
+    await pipeline(lines(), zlib.createGzip(), fs.createWriteStream(tmp));
+    await fsp.rename(tmp, data); // atomic swap: a crash never leaves a half file
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
+  await fsp.writeFile(meta, JSON.stringify({
+    v: DUPES_VERSION,
+    root: state.root,
+    name: path.basename(state.root) || state.root,
+    savedAt: header.savedAt,
+    groupCount: state.duplicates ? state.duplicates.groupCount : 0,
+    totalWasted: state.duplicates ? state.duplicates.totalWasted : 0,
+    scannedFiles: state.duplicates ? state.duplicates.scannedFiles : state.files.length,
+    cachedHashes,
+  }));
+}
+
+// Reuse the hashes of a previous run for this root (unchanged files only).
+async function loadHashCache(root) {
+  if (!root || state.hashCacheRoot === root) return state.hashCache.size;
+  const cache = new Map();
+  state.hashCache = cache;
+  state.hashCacheRoot = root;
+  try {
+    const header = await readDupesHeader();
+    if (header.v !== DUPES_VERSION || header.root !== root) return 0;
+    await streamHashes((p, c) => cache.set(p, c));
+    return cache.size;
+  } catch {
+    return 0;
+  }
+}
+
+async function saveDupesState() {
+  if (!state.root || state.scanning) return;
+  await writeDupesState();
+}
+
+let dupesSaveTimer = null;
+function scheduleSaveDupes() {
+  clearTimeout(dupesSaveTimer);
+  dupesSaveTimer = setTimeout(() => saveDupesState().catch(() => {}), 1500);
+}
+
+async function dupesInfo() {
+  try {
+    const meta = JSON.parse(await fsp.readFile(dupesPaths().meta, 'utf8'));
+    return meta.v === DUPES_VERSION ? meta : null;
+  } catch { return null; }
+}
+
+// Bring a saved analysis back into the session (no re-hashing). Only usable for
+// the root that is currently open, since every stored path must be re-authorized.
+async function loadDupesState() {
+  try {
+    if (!state.root) throw new Error('open or resume a folder first');
+    const header = await readDupesHeader();
+    if (header.v !== DUPES_VERSION) throw new Error('saved analysis is from an incompatible version');
+    if (header.root !== state.root) throw new Error(`saved analysis belongs to ${header.root}`);
+    if (!header.duplicates) throw new Error('no saved duplicate analysis');
+    authorize(header.root);
+    const cache = new Map();
+    state.hashCache = cache;
+    state.hashCacheRoot = state.root;
+    await streamHashes((p, c) => cache.set(p, c));
+    state.duplicates = { ...header.duplicates, restored: true, savedAt: header.savedAt };
+    state.dupesSavedAt = header.savedAt;
+    return state.duplicates;
+  } catch (err) {
+    return { error: String(err.message || err) };
+  }
+}
+
 // ---------------------------------------------------------------- overview
 
 function buildOverview() {
@@ -366,25 +551,33 @@ const MAX_GROUP_FILES = 1000;    // per duplicate set kept for the UI (totals st
 // spikes memory (~KB per candidate) and eventually throws V8's
 // "Too many elements passed to Promise.all", killing the duplicate/compare
 // runs on big disks. Rounding keeps at most HASH_BATCH promises in flight.
-async function hashInRounds({ items, phase, total, sem, channel, cancelled, hashFile, remember }) {
+// `lookup` (optional) returns a hash cached from an earlier run, so only new or
+// changed files are ever read from disk.
+async function hashInRounds({ items, phase, total, sem, channel, cancelled, hashFile, remember, lookup, stats }) {
   let done = 0, lastSent = 0;
   for (let i = 0; i < items.length; i += HASH_BATCH) {
     if (cancelled()) return false;
     const chunk = items.slice(i, i + HASH_BATCH);
     await Promise.all(chunk.map(async it => {
       if (cancelled()) return; // nothing new queued once a stop was requested
-      await sem.acquire();
-      try {
-        if (cancelled()) return; // cancelled while queued — hand the slot back
-        const h = await hashFile(it);
-        if (h != null) remember(it, h);
-      } catch { /* unreadable: drop from candidates */ }
-      finally { sem.release(); }
+      const cached = lookup ? lookup(it) : null;
+      if (cached == null) {
+        await sem.acquire();
+        try {
+          if (cancelled()) return; // cancelled while queued — hand the slot back
+          const h = await hashFile(it);
+          if (h != null) remember(it, h);
+        } catch { /* unreadable: drop from candidates */ }
+        finally { sem.release(); }
+      } else {
+        if (stats) stats.reused++;
+        remember(it, cached);
+      }
       done++;
       const now = Date.now();
       if (now - lastSent > 100 || done === total) {
         lastSent = now;
-        send(channel, { phase, done, total });
+        send(channel, { phase, done, total, reused: stats ? stats.reused : 0 });
       }
     }));
   }
@@ -423,16 +616,23 @@ async function findDuplicates() {
   const sizeGroups = [...bySize.values()].filter(a => a.length > 1);
   const quickList = sizeGroups.flat();
 
+  // Reuse hashes from the previous run on this root so an unchanged volume is
+  // a fast no-op pass instead of re-reading everything.
+  await loadHashCache(state.root);
+  const cacheStats = { reused: 0 };
+
   const sem = new Semaphore(6);
 
   // Pass 2: hash the first 128 KB of every size-collision file.
-  send('dupes:progress', { phase: 'quick', done: 0, total: quickList.length });
+  send('dupes:progress', { phase: 'quick', done: 0, total: quickList.length, reused: 0 });
   const quickHashes = new Map(); // file path -> quick hash
   const quickDone = await hashInRounds({
     items: quickList, phase: 'quick', total: quickList.length, sem,
     channel: 'dupes:progress', cancelled: () => state.dupeCancelled,
     hashFile: f => hashRange(f.path, 0, Math.min(f.size, QUICK_BYTES)),
-    remember: (f, h) => quickHashes.set(f.path, h),
+    lookup: f => cachedHash(f, 'quick'),
+    remember: (f, h) => { quickHashes.set(f.path, h); rememberHash(f, 'quick', h); },
+    stats: cacheStats,
   });
   if (!quickDone) { state.dupeRunning = false; return null; }
 
@@ -449,7 +649,7 @@ async function findDuplicates() {
   // Pass 3: confirm with a full-content hash (sampled for huge files).
   const fullList = [...byQuick.values()].filter(a => a.length > 1).flat()
     .filter(f => f.size > QUICK_BYTES); // small files: quick hash already covered every byte
-  send('dupes:progress', { phase: 'full', done: 0, total: fullList.length });
+  send('dupes:progress', { phase: 'full', done: 0, total: fullList.length, reused: 0 });
   const fullHashes = new Map();
   const fullDone = await hashInRounds({
     items: fullList, phase: 'full', total: fullList.length, sem,
@@ -458,7 +658,9 @@ async function findDuplicates() {
       if (f.size > FULL_HASH_LIMIT) return 'S:' + await sampledHash(f.path, f.size);
       return 'F:' + await hashRange(f.path, 0, null);
     },
-    remember: (f, h) => fullHashes.set(f.path, h),
+    lookup: f => cachedHash(f, 'full'),
+    remember: (f, h) => { fullHashes.set(f.path, h); rememberHash(f, 'full', h); },
+    stats: cacheStats,
   });
   if (!fullDone) { state.dupeRunning = false; return null; }
 
@@ -516,8 +718,14 @@ async function findDuplicates() {
     totalWasted,
     scannedFiles: state.files.length,
     candidates: quickList.length,
+    cachedHashes: cacheStats.reused, // fingerprints reused instead of re-read
+    analyzedAt: Date.now(),
   };
   state.dupeRunning = false;
+  state.dupesSavedAt = state.duplicates.analyzedAt;
+  // Persist before handing the result back: a restart (or a crash) right after
+  // the analysis must not cost the user another full run.
+  await saveDupesState().catch(() => {});
   return state.duplicates;
 }
 
@@ -709,13 +917,17 @@ async function compareRoots(rootA, rootB) {
   const candidates = [...bySize.values()].filter(arr => arr.length > 1).flat();
 
   const sem = new Semaphore(6);
+  // Warm the hash cache when one of the compared roots is the open root; the
+  // cache itself is keyed by path+size+mtime, so reusing it is always safe.
+  if (state.root === rootA || state.root === rootB) await loadHashCache(state.root);
 
-  send('compare:progress', { phase: 'quick', done: 0, total: candidates.length });
+  send('compare:progress', { phase: 'quick', done: 0, total: candidates.length, reused: 0 });
   const quickDone = await hashInRounds({
     items: candidates, phase: 'quick', total: candidates.length, sem,
     channel: 'compare:progress', cancelled: () => cmp.cancelled,
     hashFile: c => hashRange(c.f.path, 0, Math.min(c.f.size, QUICK_BYTES)),
-    remember: (c, h) => { c.qh = h; },
+    lookup: c => cachedHash(c.f, 'quick'),
+    remember: (c, h) => { c.qh = h; rememberHash(c.f, 'quick', h); },
   });
   if (!quickDone) { cmp.running = false; return null; }
 
@@ -732,7 +944,7 @@ async function compareRoots(rootA, rootB) {
     .filter(arr => arr.length > 1)
     .flat()
     .filter(c => c.f.size > QUICK_BYTES);
-  send('compare:progress', { phase: 'full', done: 0, total: fullList.length });
+  send('compare:progress', { phase: 'full', done: 0, total: fullList.length, reused: 0 });
   const fullDone = await hashInRounds({
     items: fullList, phase: 'full', total: fullList.length, sem,
     channel: 'compare:progress', cancelled: () => cmp.cancelled,
@@ -740,9 +952,11 @@ async function compareRoots(rootA, rootB) {
       if (c.f.size > FULL_HASH_LIMIT) return 'S:' + await sampledHash(c.f.path, c.f.size);
       return 'F:' + await hashRange(c.f.path, 0, null);
     },
-    remember: (c, h) => { c.fh = h; },
+    lookup: c => cachedHash(c.f, 'full'),
+    remember: (c, h) => { c.fh = h; rememberHash(c.f, 'full', h); },
   });
   if (!fullDone) { cmp.running = false; return null; }
+  scheduleSaveDupes(); // refresh the hash cache for next time
 
   const finalMap = new Map();
   for (const arr of byQuick.values()) {
@@ -1212,27 +1426,129 @@ ipcMain.handle('dupes:find', async () => {
 
 ipcMain.handle('dupes:cancel', () => { state.dupeCancelled = true; return true; });
 
-ipcMain.handle('files:trash', async (_e, paths) => {
-  const trashed = [];
-  const failed = [];
-  if (!Array.isArray(paths)) return { trashed, failed };
-  for (const p of paths) {
-    if (!isAuthorized(p)) { failed.push({ path: p, error: 'outside authorized folders' }); continue; }
-    try {
-      await shell.trashItem(p);
-      trashed.push(p);
-      removeFromIndex(p);
-    } catch (err) {
-      failed.push({ path: p, error: String(err.message || err) });
+// Meta of the last saved analysis, so the Duplicates view can offer to bring it
+// back (with its cached hashes) instead of re-reading the whole volume.
+ipcMain.handle('dupes:info', () => dupesInfo());
+
+ipcMain.handle('dupes:load', async () => {
+  try {
+    const res = await loadDupesState();
+    if (res && res.error) return res;
+    return res;
+  } catch (err) {
+    return { error: String(err.message || err) };
+  }
+});
+
+// ------------------------------------------------------------- trash helpers
+//
+// "Move to Trash" has to be honest on removable volumes: files on an external
+// drive go to that drive's own Trash (<volume>/.Trashes/<uid>), which Finder
+// often does not show, and the space is only reclaimed when that drive's Trash
+// is emptied. So every move is verified, the destination is reported back, and
+// emptying a drive's Trash is an explicit, separate action.
+
+function volumeOf(p) {
+  if (process.platform === 'win32') {
+    const m = /^([A-Za-z]:\\)/.exec(p);
+    return m ? m[1] : null;
+  }
+  const parts = p.split(path.sep);
+  if (parts.length > 2 && parts[1] === 'Volumes') return path.join(path.sep, parts[1], parts[2]);
+  return path.sep;
+}
+
+function volumeTrashDir(volume) {
+  if (!volume) return null;
+  if (process.platform === 'win32') return null; // Recycle Bin has no browsable path
+  return path.join(volume, '.Trashes', String(process.getuid()));
+}
+
+// A volume is actionable if the user opened a folder on it (or below it).
+function isAuthorizedVolume(volume) {
+  if (!volume) return false;
+  if (isAuthorized(volume)) return true;
+  for (const r of authorizedRoots) {
+    if (r === volume || r.startsWith(volume.endsWith(path.sep) ? volume : volume + path.sep)) return true;
+  }
+  return false;
+}
+
+async function dirStats(dir, cap = 200000) {
+  let items = 0, bytes = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries;
+    try { entries = await fsp.readdir(cur, { withFileTypes: true }); }
+    catch { continue; }
+    for (const ent of entries) {
+      const full = path.join(cur, ent.name);
+      if (ent.isDirectory()) { stack.push(full); continue; }
+      items++;
+      if (items > cap) return { items, bytes, capped: true };
+      try { bytes += (await fsp.stat(full)).size; } catch { /* gone already */ }
     }
   }
+  return { items, bytes, capped: false };
+}
+
+const withTimeout = (promise, ms, message) => Promise.race([
+  promise,
+  new Promise((_res, rej) => setTimeout(() => rej(new Error(message)), ms)),
+]);
+
+async function trashFiles(paths) {
+  const trashed = [];
+  const failed = [];
+  const volumes = new Map(); // volume -> { trashed, bytes }
+  if (!Array.isArray(paths)) return { trashed, failed, volumes: [] };
+  state.trashCancelled = false;
+
+  let done = 0;
+  let lastSent = 0;
+  for (const p of paths) {
+    if (state.trashCancelled) { failed.push({ path: p, error: 'cancelled' }); continue; }
+    if (!isAuthorized(p)) { failed.push({ path: p, error: 'outside authorized folders' }); continue; }
+    let size = 0;
+    try { size = (await fsp.stat(p)).size; } catch { /* size is only for the report */ }
+    try {
+      // Bound each move: a stalled filesystem must not freeze the whole run.
+      await withTimeout(shell.trashItem(p), 30000, 'timed out moving to Trash');
+      // Verify against the filesystem — never trust the call alone, or the UI
+      // (and the index) would claim a delete that never happened.
+      if (fs.existsSync(p)) throw new Error('file is still on disk after the Trash move was reported as successful');
+      trashed.push(p);
+      removeFromIndex(p);
+      const vol = volumeOf(p);
+      const v = volumes.get(vol) || { volume: vol, trashDir: volumeTrashDir(vol), files: 0, bytes: 0 };
+      v.files++; v.bytes += size;
+      volumes.set(vol, v);
+    } catch (err) {
+      failed.push({ path: p, error: String((err && err.message) || err) });
+    }
+    done++;
+    const now = Date.now();
+    if (now - lastSent > 100 || done === paths.length) {
+      lastSent = now;
+      send('trash:progress', { done, total: paths.length, trashed: trashed.length, failed: failed.length });
+    }
+  }
+  return { trashed, failed, volumes: [...volumes.values()] };
+}
+
+// Move files to the Trash and fold the outcome into the session state. Only
+// files verified as gone leave the index, so a failed move can never make the
+// UI (or the saved analysis) claim a cleanup that did not happen.
+async function trashAndUpdate(paths) {
+  const { trashed, failed, volumes } = await trashFiles(paths);
   if (trashed.length) {
     const gone = new Set(trashed);
     state.files = state.files.filter(f => !gone.has(f.path));
     if (state.duplicates) {
       // Row lists per group are capped (MAX_GROUP_FILES), while count/wasted
-      // are exact totals — so update totals from what left the set, not from
-      // how many rows remain.
+      // are exact totals — so update totals by what left each set, not by how
+      // many rows remain.
       const kept = [];
       for (const g of state.duplicates.groups) {
         const before = g.files.length;
@@ -1261,8 +1577,60 @@ ipcMain.handle('files:trash', async (_e, paths) => {
       state.similar.totalSavings = state.similar.clusters.reduce((s, c) => s + c.savings, 0);
     }
     scheduleSaveIndex();
+    scheduleSaveDupes(); // the analysis itself changed (groups lost copies)
   }
-  return { trashed, failed };
+  return { trashed, failed, volumes };
+}
+
+ipcMain.handle('files:trash', (_e, paths) => trashAndUpdate(paths));
+
+ipcMain.handle('trash:cancel', () => { state.trashCancelled = true; return true; });
+
+// How much is sitting in a volume's own Trash (external drives keep their own),
+// and whether we are allowed to look at it.
+ipcMain.handle('trash:volumeInfo', async (_e, volume) => {
+  try {
+    if (!isAuthorizedVolume(volume)) return { error: 'Open a folder on that volume first.' };
+    const dir = volumeTrashDir(volume);
+    if (!dir) return { volume, trashDir: null, ok: false, error: 'This platform has no browsable Trash path.' };
+    const st = await fsp.stat(dir).catch(() => null);
+    if (!st) return { volume, trashDir: dir, ok: true, items: 0, bytes: 0, empty: true };
+    const { items, bytes, capped } = await dirStats(dir);
+    return { volume, trashDir: dir, ok: true, items, bytes, capped, empty: items === 0 };
+  } catch (err) {
+    return { volume, trashDir: volumeTrashDir(volume), ok: false, error: String((err && err.message) || err) };
+  }
+});
+
+// Permanently empty a drive's Trash — the step that actually frees the space.
+// Explicitly requested by the user (never automatic) and confirmed in the UI.
+ipcMain.handle('trash:emptyVolume', async (_e, volume) => {
+  try {
+    if (!isAuthorizedVolume(volume)) return { error: 'Open a folder on that volume first.' };
+    const dir = volumeTrashDir(volume);
+    if (!dir) return { error: 'No browsable Trash for this platform.' };
+    const before = await dirStats(dir);
+    let entries;
+    try { entries = await fsp.readdir(dir); }
+    catch (err) {
+      return {
+        error: `macOS would not let Nebula read ${dir} (${(err && err.message) || err}). ` +
+          'Empty it from Finder instead: click the Trash icon in the Dock while holding Option, ' +
+          'then choose “Empty Trash” for this drive — or grant Nebula Full Disk Access in ' +
+          'System Settings → Privacy & Security.',
+        dir, freed: 0, items: 0,
+      };
+    }
+    let removed = 0;
+    const failed = [];
+    for (const name of entries) {
+      try { await fsp.rm(path.join(dir, name), { recursive: true, force: true }); removed++; }
+      catch (err) { failed.push({ path: path.join(dir, name), error: String((err && err.message) || err) }); }
+    }
+    return { dir, items: before.items, bytes: before.bytes, removed, failed };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
 });
 
 ipcMain.handle('files:reveal', (_e, p) => {
@@ -1323,4 +1691,6 @@ module.exports.__test = {
   state, CFG, runScan, findDuplicates, findSimilarPhotos, compareRoots,
   saveIndex, loadIndex, capturePrevSnapshot, computeDiff, dhashImage, hamming,
   buildOrganizePlan, applyOrganize, undoOrganize,
+  saveDupesState, loadDupesState, loadHashCache, dupesInfo, trashFiles, trashAndUpdate, volumeOf,
+  volumeTrashDir, dirStats, cachedHash, rememberHash,
 };
