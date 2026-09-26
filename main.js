@@ -1310,7 +1310,7 @@ ipcMain.handle('app:quickFolders', () => {
 // its contents are copies the user already decided to remove, so listing them as
 // duplicates again would be noise. Refuse it with something actionable instead.
 async function refuseOwnTrash(root) {
-  if (!isNebulaTrashDir(root)) return null;
+  if (!isInsideNebulaTrash(root)) return null;
   const info = await nebulaTrashSessions(volumeOf(root)).catch(() => null);
   const waiting = info && info.files ? ` It currently holds ${info.files} removed file${info.files === 1 ? '' : 's'} (${(info.bytes / 1048576).toFixed(0)} MB).` : '';
   return {
@@ -1519,6 +1519,18 @@ const isInside = (parent, p) => p === parent || (typeof p === 'string' && p.star
 function isNebulaTrashDir(dir) {
   if (path.basename(dir) !== NEBULA_TRASH_NAME) return false;
   try { return fs.existsSync(path.join(dir, NEBULA_TRASH_MARKER)); } catch { return false; }
+}
+
+// True for the Trash folder itself and for anything inside it (a session folder,
+// or a path a user drilled into) — none of it should ever be scanned.
+function isInsideNebulaTrash(p) {
+  const vol = volumeOf(p);
+  let cur = p;
+  while (cur && cur !== vol && cur !== path.dirname(cur)) {
+    if (isNebulaTrashDir(cur)) return true;
+    cur = path.dirname(cur);
+  }
+  return isNebulaTrashDir(cur);
 }
 
 function sessionStamp(at = Date.now()) {
@@ -2027,6 +2039,6 @@ module.exports.__test = {
   volumeTrashDir, dirStats, cachedHash, rememberHash,
   // Nebula Trash (drive-local removed-copies folder)
   nebulaTrashRoot, moveIntoNebulaTrash, nebulaTrashSessions, restoreNebulaTrash, emptyNebulaTrash,
-  trashInfo, useNebulaTrash, isNebulaTrashDir, refuseOwnTrash, NEBULA_TRASH_NAME, NEBULA_TRASH_MARKER,
+  trashInfo, useNebulaTrash, isNebulaTrashDir, isInsideNebulaTrash, refuseOwnTrash, NEBULA_TRASH_NAME, NEBULA_TRASH_MARKER,
   setVolumeResolver: fn => { volumeResolver = fn; },
 };

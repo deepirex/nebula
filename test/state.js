@@ -192,6 +192,10 @@ app.whenReady().then(async () => {
     check('scanning the Trash folder is refused with a report', refused && /isn't scanned/.test(refused.error) && /1 removed file/.test(refused.error),
       refused && refused.error);
     check('normal folders are not refused', (await t.refuseOwnTrash(path.join(volDir, 'photos'))) === null);
+    const session = (await t.trashInfo(volDir)).sessions[0];
+    check('a session folder inside the Trash is refused too',
+      !!(await t.refuseOwnTrash(session.dir)) && t.isInsideNebulaTrash(path.join(session.dir, 'photos', 'trip')) === true,
+      session.dir);
 
     // ---- 10. legacy system Trash on a Nebula-Trash volume is still reported
     const legacyDir = t.volumeTrashDir(volDir);
