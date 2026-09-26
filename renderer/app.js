@@ -1283,8 +1283,10 @@ function nebulaTrashPanelHtml() {
       <div class="dupe-note">From before Nebula kept its own Trash folder, at <code>${esc(legacy.dir)}</code> — Finder usually doesn't show it, and the space stays used until it is emptied.</div>
       ${legacy.readable
         ? `<button class="btn btn-danger btn-small" data-empty-volume="${esc(info.volume)}">Empty that system Trash…</button>`
-        : `<div class="dupe-note cleanup-warn">macOS won't let Nebula read it. Empty it from Finder — hold Option and click the Trash icon in the Dock, choose “Empty Trash” for this drive — or grant Nebula Full Disk Access in System Settings → Privacy & Security.</div>
-           <div class="dupe-note">Or run this in Terminal (no wildcard, so the shell cannot fail on permissions): <code>sudo rm -rf ${esc(legacy.dir)}</code></div>`}
+        : `<div class="dupe-note cleanup-warn">macOS protects this folder (Trash access needs Full Disk Access), so Nebula can't read or empty it.</div>
+           <div class="dupe-note"><strong>Easiest:</strong> in Finder hold <strong>Option</strong>, click the Trash icon in the Dock, and choose <strong>“Empty Trash”</strong> for this drive — Finder is allowed where other apps are not.</div>
+           <div class="dupe-note">Or grant <strong>Nebula</strong> Full Disk Access (System Settings → Privacy & Security → Full Disk Access) and use this button again.</div>
+           <div class="dupe-note">A Terminal command only works if that terminal app itself has Full Disk Access — root does <em>not</em> bypass it, so <code>sudo</code> alone fails with “Operation not permitted”: <code>sudo rm -rf ${esc(legacy.dir)}</code></div>`}
     </div>` : '';
 
   const head = hasNebula
