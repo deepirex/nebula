@@ -38,7 +38,12 @@ detection, and a largest-files explorer — wrapped in a dark, glassy dashboard.
   a drive's own `.Trashes/<uid>` folder is invisible to Finder and unreadable to
   apps without Full Disk Access, so files moved there look like they vanished and
   the space stays used. Nebula never scans its own Trash folders, so removed
-  copies can never reappear as duplicates.
+  copies can never reappear as duplicates — and Nebula refuses to scan that
+  folder if you pick it, telling you how many files are waiting and pointing you
+  at the Duplicates view instead. Anything already waiting (including leftovers
+  in a drive's own `.Trashes` folder from before this feature) is reported on the
+  dashboard, in the Duplicates view, and right after a scan, with the exact
+  command to empty it if macOS blocks the app from doing so.
 - **Similar Photos** — perceptual (dHash) fingerprinting clusters resized,
   re-exported, and lightly edited versions of the same shot, with thumbnails.
   Auto-select keeps the sharpest (highest-resolution) copy of each group.

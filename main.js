@@ -1306,8 +1306,23 @@ ipcMain.handle('app:quickFolders', () => {
   return out;
 });
 
+// Nebula's own Trash folder is managed from the Duplicates view, never scanned:
+// its contents are copies the user already decided to remove, so listing them as
+// duplicates again would be noise. Refuse it with something actionable instead.
+async function refuseOwnTrash(root) {
+  if (!isNebulaTrashDir(root)) return null;
+  const info = await nebulaTrashSessions(volumeOf(root)).catch(() => null);
+  const waiting = info && info.files ? ` It currently holds ${info.files} removed file${info.files === 1 ? '' : 's'} (${(info.bytes / 1048576).toFixed(0)} MB).` : '';
+  return {
+    error: `That's Nebula's own Trash folder — it isn't scanned.${waiting} ` +
+      'Open the Duplicates view to restore those files or empty the folder and free the space.',
+  };
+}
+
 ipcMain.handle('scan:start', async (_e, root) => {
   if (state.scanning) return { error: 'A scan is already running.' };
+  const refused = await refuseOwnTrash(root);
+  if (refused) return refused;
   try {
     await capturePrevSnapshot(root); // keep the old index of this root for the Changes view
     state.similar = null;
@@ -1337,6 +1352,8 @@ ipcMain.handle('diff:get', () => computeDiff());
 
 ipcMain.handle('compare:run', async (_e, rootA, rootB) => {
   if (cmp.running) return { error: 'A comparison is already running.' };
+  const refused = (await refuseOwnTrash(rootA)) || (await refuseOwnTrash(rootB));
+  if (refused) return refused;
   try {
     const res = await compareRoots(rootA, rootB);
     return res || { cancelled: true };
@@ -1671,19 +1688,36 @@ async function emptyNebulaTrash(volume, sessionId) {
 
 async function trashInfo(volume) {
   const mode = useNebulaTrash(volume) ? 'nebula' : 'os';
+  let result;
   if (mode === 'nebula') {
     const info = await nebulaTrashSessions(volume);
-    return { volume, mode, dir: info.root, sessions: info.sessions, files: info.files, bytes: info.bytes };
+    result = { volume, mode, dir: info.root, sessions: info.sessions, files: info.files, bytes: info.bytes };
+  } else {
+    const dir = volumeTrashDir(volume);
+    let files = 0, bytes = 0, readable = true, error = null;
+    const st = dir ? await fsp.stat(dir).catch(() => null) : null;
+    if (dir && st) {
+      const stats = await dirStats(dir);
+      files = stats.items; bytes = stats.bytes;
+      if (stats.unreadable && !stats.items) { readable = false; error = trashUnreadableMessage(dir); }
+    }
+    result = { volume, mode, dir, sessions: [], files, bytes, readable, error };
   }
-  const dir = volumeTrashDir(volume);
-  let files = 0, bytes = 0, readable = true, error = null;
-  const st = dir ? await fsp.stat(dir).catch(() => null) : null;
-  if (dir && st) {
-    const stats = await dirStats(dir);
-    files = stats.items; bytes = stats.bytes;
-    if (stats.unreadable && !stats.items) { readable = false; error = trashUnreadableMessage(dir); }
+
+  // Leftovers in the drive's own system Trash — anything removed before Nebula
+  // kept its own folder. The user has to be told to empty that, or the space
+  // stays used with no explanation.
+  const legacyDir = mode === 'nebula' ? volumeTrashDir(volume) : null;
+  const legacySt = legacyDir ? await fsp.stat(legacyDir).catch(() => null) : null;
+  if (legacySt) {
+    const stats = await dirStats(legacyDir);
+    const readable = !(stats.unreadable && !stats.items);
+    result.legacy = {
+      dir: legacyDir, files: stats.items, bytes: stats.bytes, readable,
+      error: readable ? null : trashUnreadableMessage(legacyDir),
+    };
   }
-  return { volume, mode, dir, sessions: [], files, bytes, readable, error };
+  return result;
 }
 
 // A volume is actionable if the user opened a folder on it (or below it).
@@ -1993,6 +2027,6 @@ module.exports.__test = {
   volumeTrashDir, dirStats, cachedHash, rememberHash,
   // Nebula Trash (drive-local removed-copies folder)
   nebulaTrashRoot, moveIntoNebulaTrash, nebulaTrashSessions, restoreNebulaTrash, emptyNebulaTrash,
-  trashInfo, useNebulaTrash, isNebulaTrashDir, NEBULA_TRASH_NAME, NEBULA_TRASH_MARKER,
+  trashInfo, useNebulaTrash, isNebulaTrashDir, refuseOwnTrash, NEBULA_TRASH_NAME, NEBULA_TRASH_MARKER,
   setVolumeResolver: fn => { volumeResolver = fn; },
 };

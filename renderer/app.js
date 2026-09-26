@@ -388,6 +388,9 @@ async function startScan(root) {
   enableNav();
   updateRootCard(res);
   await refreshSavedDupes(); // offer the saved analysis for this root instead of a re-run
+  await refreshTrashInfo();
+  const waiting = trashWaitingSummary();
+  if (waiting) toast(waiting, true, 10000);
 
   if (res.cancelled) toast('Scan cancelled — showing partial results');
   else if (res.errors > 0) toast(`Scan complete. ${fmtNum(res.errors)} items were skipped (no permission).`);
@@ -469,6 +472,7 @@ async function resumeSavedIndex(btn) {
 
 async function renderDashboard() {
   S.overview = await api.overview();
+  await refreshTrashInfo();
   const o = S.overview;
   const el = $('#view-dashboard');
   if (!o) { el.innerHTML = '<div class="empty-note">No scan data yet.</div>'; return; }
@@ -534,7 +538,9 @@ async function renderDashboard() {
         <div class="panel-title">Top extensions</div>
         <div class="bar-list" id="dash-exts"></div>
       </div>
-    </div>`;
+    </div>
+
+    ${nebulaTrashPanelHtml()}`;
 
   buildDonut(o);
   buildTopDirs(o);
@@ -543,6 +549,7 @@ async function renderDashboard() {
 
   el.querySelectorAll('[data-action="go-dupes"]').forEach(b =>
     b.addEventListener('click', () => { setView('dupes'); runDupeAnalysis(); }));
+  wireTrashActions(el); // anything waiting in removed-copies storage is actionable here too
   maybeAnimate(el);
 }
 
@@ -1253,48 +1260,78 @@ function cleanupSummaryHtml() {
 }
 
 // Anything already sitting in a drive-local Nebula Trash is always reachable —
-// not only right after a cleanup.
+// not only right after a cleanup — and leftovers in the drive's own system Trash
+// (removed before Nebula kept its own folder) are surfaced too, so the user is
+// told to empty them instead of wondering why space never comes back.
 function nebulaTrashPanelHtml() {
   const info = S.trashInfo;
-  if (!info || info.mode !== 'nebula' || !info.files) return '';
-  const sessions = (info.sessions || []).map(s => `
+  if (!info) return '';
+  const hasNebula = info.mode === 'nebula' && info.files > 0;
+  const legacy = info.legacy && info.legacy.files > 0 ? info.legacy : null;
+  if (!hasNebula && !legacy) return '';
+
+  const sessions = hasNebula ? (info.sessions || []).map(s => `
     <div class="cleanup-vol">
       <div class="cleanup-vol-head">${fmtNum(s.files)} files · ${esc(fmtBytes(s.bytes))} — removed ${esc(fmtDate(s.at))}</div>
       <button class="btn btn-ghost btn-small" data-restore-session="${esc(s.id)}" data-volume="${esc(info.volume)}">Restore</button>
       <button class="btn btn-danger btn-small" data-empty-session="${esc(s.id)}" data-volume="${esc(info.volume)}">Empty — free ${esc(fmtBytes(s.bytes))}</button>
-    </div>`).join('');
+    </div>`).join('') : '';
+
+  const legacyHtml = legacy ? `
+    <div class="cleanup-vol">
+      <div class="cleanup-vol-head">${fmtNum(legacy.files)} files · ${esc(fmtBytes(legacy.bytes))} are still in this drive's own system Trash</div>
+      <div class="dupe-note">From before Nebula kept its own Trash folder, at <code>${esc(legacy.dir)}</code> — Finder usually doesn't show it, and the space stays used until it is emptied.</div>
+      ${legacy.readable
+        ? `<button class="btn btn-danger btn-small" data-empty-volume="${esc(info.volume)}">Empty that system Trash…</button>`
+        : `<div class="dupe-note cleanup-warn">macOS won't let Nebula read it. Empty it from Finder — hold Option and click the Trash icon in the Dock, choose “Empty Trash” for this drive — or grant Nebula Full Disk Access in System Settings → Privacy & Security.</div>
+           <div class="dupe-note">Or run this in Terminal (no wildcard, so the shell cannot fail on permissions): <code>sudo rm -rf ${esc(legacy.dir)}</code></div>`}
+    </div>` : '';
+
+  const head = hasNebula
+    ? `<h3>${fmtNum(info.files)} removed copies (${esc(fmtBytes(info.bytes))}) in Nebula Trash</h3>
+       <div class="dupe-note">On <strong>${esc(info.volume)}</strong> at <code>${esc(info.dir)}</code> — visible in Finder, restorable, and never scanned as duplicates.</div>`
+    : `<h3>Removed copies are waiting on ${esc(info.volume)}</h3>
+       <div class="dupe-note">Emptying them is what actually frees the space.</div>`;
+
   return `
     <div class="panel dupe-cleanup">
       <div class="cleanup-head">
-        <div>
-          <h3>${fmtNum(info.files)} removed copies (${esc(fmtBytes(info.bytes))}) in Nebula Trash</h3>
-          <div class="dupe-note">On <strong>${esc(info.volume)}</strong> at <code>${esc(info.dir)}</code> — visible in Finder, restorable, and never scanned as duplicates.</div>
-        </div>
-        <button class="btn btn-danger btn-small" data-empty-all="${esc(info.volume)}">Empty all — free ${esc(fmtBytes(info.bytes))}</button>
+        <div>${head}</div>
+        ${hasNebula ? `<button class="btn btn-danger btn-small" data-empty-all="${esc(info.volume)}">Empty all — free ${esc(fmtBytes(info.bytes))}</button>` : ''}
       </div>
       ${sessions}
+      ${legacyHtml}
     </div>`;
 }
 
-function wireCleanupSummary() {
-  const el = document.querySelector('#view-dupes');
-  if (!el) return;
-  const dismiss = el.querySelector('#btn-dismiss-cleanup');
-  if (dismiss) dismiss.addEventListener('click', () => { S.dupeCleanup = null; renderDupes(); });
+// One line telling the user what is waiting, used right after a scan.
+function trashWaitingSummary() {
+  const info = S.trashInfo;
+  if (!info) return '';
+  const bits = [];
+  if (info.mode === 'nebula' && info.files > 0) bits.push(`${fmtNum(info.files)} removed copies (${fmtBytes(info.bytes)}) in Nebula Trash`);
+  if (info.legacy && info.legacy.files > 0) bits.push(`${fmtNum(info.legacy.files)} files (${fmtBytes(info.legacy.bytes)}) in this drive's system Trash`);
+  if (!bits.length) return '';
+  return `${bits.join(' and ')} can be emptied to free space — open Duplicates.`;
+}
 
-  el.querySelectorAll('[data-restore-session]').forEach(btn =>
+// Restore/empty buttons for removed copies — shared by the Duplicates view and
+// the dashboard, so anything waiting is actionable wherever the user is.
+function wireTrashActions(scope) {
+  if (!scope) return;
+  scope.querySelectorAll('[data-restore-session]').forEach(btn =>
     btn.addEventListener('click', () => restoreFromNebulaTrash(btn.dataset.volume, btn.dataset.restoreSession || null)));
-  el.querySelectorAll('[data-empty-session]').forEach(btn =>
+  scope.querySelectorAll('[data-empty-session]').forEach(btn =>
     btn.addEventListener('click', () => emptyNebulaTrashFlow(btn.dataset.volume, btn.dataset.emptySession || null)));
-  el.querySelectorAll('[data-empty-all]').forEach(btn =>
+  scope.querySelectorAll('[data-empty-all]').forEach(btn =>
     btn.addEventListener('click', () => emptyNebulaTrashFlow(btn.dataset.emptyAll, null)));
-  el.querySelectorAll('[data-empty-volume]').forEach(btn =>
+  scope.querySelectorAll('[data-empty-volume]').forEach(btn =>
     btn.addEventListener('click', () => emptyVolumeTrashFlow(btn.dataset.emptyVolume, btn)));
 
-  // Ask the main process what is actually sitting in each drive's Trash — on
-  // macOS the system Trash may be unreadable without Full Disk Access, and the
-  // user needs to know that rather than assume the cleanup did nothing.
-  el.querySelectorAll('[data-trash-status]').forEach(async node => {
+  // Ask the main process what is actually sitting in a drive's system Trash — on
+  // macOS it may be unreadable without Full Disk Access, and the user needs to
+  // know that rather than assume the cleanup did nothing.
+  scope.querySelectorAll('[data-trash-status]').forEach(async node => {
     const volume = node.dataset.trashStatus;
     const info = await api.volumeTrashInfo(volume);
     if (!node.isConnected) return;
@@ -1306,6 +1343,14 @@ function wireCleanupSummary() {
       node.textContent = `That Trash is currently empty.`;
     }
   });
+}
+
+function wireCleanupSummary() {
+  const el = document.querySelector('#view-dupes');
+  if (!el) return;
+  const dismiss = el.querySelector('#btn-dismiss-cleanup');
+  if (dismiss) dismiss.addEventListener('click', () => { S.dupeCleanup = null; renderDupes(); });
+  wireTrashActions(el);
 }
 
 async function refreshTrashInfo() {

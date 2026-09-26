@@ -185,6 +185,26 @@ app.whenReady().then(async () => {
     const emptied = await t.emptyNebulaTrash(volDir, null);
     check('empty reports the freed bytes and removes the folder', emptied.removed === 1 && emptied.bytes === before2 && !fs.existsSync(t.nebulaTrashRoot(volDir)),
       JSON.stringify(emptied));
+    // ---- 9. Nebula's own Trash is never scanned, but says what is waiting
+    await t.trashAndUpdate([path.join(volDir, 'photos', 'trip', 'a-copy.jpg')]);
+    check('the Trash folder identifies itself', t.isNebulaTrashDir(t.nebulaTrashRoot(volDir)) === true);
+    const refused = await t.refuseOwnTrash(t.nebulaTrashRoot(volDir));
+    check('scanning the Trash folder is refused with a report', refused && /isn't scanned/.test(refused.error) && /1 removed file/.test(refused.error),
+      refused && refused.error);
+    check('normal folders are not refused', (await t.refuseOwnTrash(path.join(volDir, 'photos'))) === null);
+
+    // ---- 10. legacy system Trash on a Nebula-Trash volume is still reported
+    const legacyDir = t.volumeTrashDir(volDir);
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'old-leftover.bin'), Buffer.alloc(4096, 4));
+    const withLegacy = await t.trashInfo(volDir);
+    check('leftovers in the drive\'s system Trash are reported',
+      withLegacy.legacy && withLegacy.legacy.files === 1 && withLegacy.legacy.bytes === 4096 && withLegacy.legacy.readable === true,
+      JSON.stringify(withLegacy.legacy));
+    const cleared = await t.emptyNebulaTrash(volDir, null); // must only touch Nebula's own folder
+    check('emptying Nebula Trash leaves the drive\'s system Trash alone',
+      fs.existsSync(path.join(legacyDir, 'old-leftover.bin')), `removed=${cleared.removed}`);
+    fs.rmSync(legacyDir, { recursive: true, force: true });
     t.setVolumeResolver(null);
 
     console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL STATE/TRASH CHECKS PASSED');
